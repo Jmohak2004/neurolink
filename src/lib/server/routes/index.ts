@@ -52,7 +52,10 @@ export function createAllRoutes(
   options?: CreateRoutesOptions,
 ): RouteGroup[] {
   const routes: RouteGroup[] = [
-    createAgentRoutes(basePath, options?.agent),
+    createAgentRoutes(basePath, {
+      ...options?.agent,
+      perUserAuth: options?.perUserAuth,
+    }),
     createToolRoutes(basePath),
     createMCPRoutes(basePath),
     createMemoryRoutes(basePath),
@@ -97,15 +100,25 @@ export function createAllRoutes(
 
 /**
  * Register all routes with a server adapter
+ *
+ * With `options.perUserAuth` this also turns on the adapter's
+ * `carryMiddlewareState` (`enableMiddlewareStateCarry()`): the agent routes can
+ * only take identity from `ctx.user` if the adapter hands the handler what
+ * authentication middleware set. An adapter without that method carries state
+ * itself, or the routes see no user.
  */
 export function registerAllRoutes(
   adapter: {
     registerRouteGroup: (group: RouteGroup) => void;
     listRoutes?: () => RouteDefinition[];
+    enableMiddlewareStateCarry?: () => void;
   },
   basePath: string = "/api",
   options?: CreateRoutesOptions,
 ): void {
+  if (options?.perUserAuth) {
+    adapter.enableMiddlewareStateCarry?.();
+  }
   // If adapter has listRoutes and getRoutes not provided, use adapter's listRoutes
   const routeOptions: CreateRoutesOptions = {
     ...options,

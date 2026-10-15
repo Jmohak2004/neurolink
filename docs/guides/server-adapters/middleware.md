@@ -619,7 +619,12 @@ server.registerMiddleware(
     maxRequests: 1000,
     windowMs: 60 * 60 * 1000, // 1 hour
     keyGenerator: (ctx) =>
-      ctx.user?.id || ctx.headers["x-forwarded-for"] || "unknown",
+      // A shared identity (one API key for many callers) is not a person. Read
+      // x-forwarded-for only behind a trusted proxy that sets or overwrites
+      // it; otherwise the client chooses its own bucket by sending any value.
+      ctx.user && !ctx.user.shared
+        ? ctx.user.id
+        : ctx.headers["x-forwarded-for"] || "unknown",
   }),
 );
 ```
@@ -720,9 +725,21 @@ type AuthResult = {
   id: string;
   email?: string;
   roles?: string[];
+  /** true when this identity stands for every holder of one credential (a shared API key), not one person. */
+  shared?: boolean;
   metadata?: Record<string, unknown>;
 };
 ```
+
+The authenticated user is set on `ctx.user`. It reaches later middleware and the
+route handler on every adapter only when the server is created with
+`carryMiddlewareState: true`; by default Express, Fastify and Koa hand each
+middleware step and the handler a fresh context, so a role guard registered after
+authentication refuses everyone there. See
+[Carrying middleware state](./security.md#carrying-middleware-state-to-guards-and-handlers-carrymiddlewarestate)
+in the security guide. Whether the agent routes treat `ctx.user` as the caller is
+a separate choice: see `perUserAuth` in the
+[security guide](./security.md#who-the-agent-routes-treat-as-the-user-peruserauth).
 
 ### Usage
 
@@ -760,7 +777,9 @@ server.registerMiddleware(
   }),
 );
 
-// Role-based access control (after authentication)
+// Role-based access control (after authentication). It reads ctx.user, so the
+// server needs carryMiddlewareState: true (see the note above), or the guard
+// refuses everyone on Express, Fastify and Koa.
 server.registerMiddleware(
   createRoleMiddleware({
     requiredRoles: ["admin"],

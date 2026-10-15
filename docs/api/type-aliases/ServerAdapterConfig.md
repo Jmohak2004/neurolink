@@ -113,3 +113,29 @@ Stream redaction configuration (disabled by default)
 > `optional` **shutdown?**: [`ShutdownConfig`](ShutdownConfig.md)
 
 Shutdown configuration for graceful shutdown behavior
+
+---
+
+### carryMiddlewareState?
+
+> `optional` **carryMiddlewareState?**: `boolean`
+
+Carry what middleware sets on its context (`ctx.user`, `ctx.session`,
+`ctx.metadata`, `ctx.abortSignal` and `ctx.abortController`) to later
+middleware and to the route handler, on every adapter (default: `false`).
+
+Off, each adapter propagates context as it always did. Express, Fastify
+and Koa build a fresh context for every middleware step and for the
+handler and carry only `responseHeaders`; Hono shares one context between
+the steps and the handler only when the caller sent its own
+`X-Request-ID`. So a role guard, a permission guard or a rate-limit
+`keyGenerator` registered after authentication sees `ctx.user` only there:
+on the other requests the guard refuses everyone, because the user never
+reaches it.
+
+On, the user and the rest reach later middleware and the handler on every
+adapter. Set it when guards or key generators depend on `ctx.user`.
+`registerAllRoutes()` turns it on for the server by itself when called with
+`perUserAuth`, which needs the user in the handler. A caller that builds
+the agent routes with `createAgentRoutes(basePath, { perUserAuth: true })`
+and registers them itself must set this on the server.

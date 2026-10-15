@@ -68,6 +68,29 @@ export type ServerAdapterConfig = {
 
   /** Shutdown configuration for graceful shutdown behavior */
   shutdown?: ShutdownConfig;
+
+  /**
+   * Carry what middleware sets on its context (`ctx.user`, `ctx.session`,
+   * `ctx.metadata`, `ctx.abortSignal` and `ctx.abortController`) to later
+   * middleware and to the route handler, on every adapter (default: `false`).
+   *
+   * Off, each adapter propagates context as it always did. Express, Fastify
+   * and Koa build a fresh context for every middleware step and for the
+   * handler and carry only `responseHeaders`; Hono shares one context between
+   * the steps and the handler only when the caller sent its own
+   * `X-Request-ID`. So a role guard, a permission guard or a rate-limit
+   * `keyGenerator` registered after authentication sees `ctx.user` only there:
+   * on the other requests the guard refuses everyone, because the user never
+   * reaches it.
+   *
+   * On, the user and the rest reach later middleware and the handler on every
+   * adapter. Set it when guards or key generators depend on `ctx.user`.
+   * `registerAllRoutes()` turns it on for the server by itself when called with
+   * `perUserAuth`, which needs the user in the handler. A caller that builds
+   * the agent routes with `createAgentRoutes(basePath, { perUserAuth: true })`
+   * and registers them itself must set this on the server.
+   */
+  carryMiddlewareState?: boolean;
 };
 
 /**
@@ -87,6 +110,7 @@ export type RequiredServerAdapterConfig = {
   disableBuiltInHealth: boolean;
   redaction?: RequiredRedactionConfig;
   shutdown: RequiredShutdownConfig;
+  carryMiddlewareState: boolean;
 };
 
 /**
@@ -331,6 +355,16 @@ export type ServerContext = {
   /** Redaction configuration (for stream redaction support) */
   redaction?: RedactionConfig;
 };
+
+/**
+ * What middleware sets on its context that later middleware and the route
+ * handler must see. Adapters build a fresh context for every step, so this is
+ * what they carry between steps in the framework's per-request storage.
+ */
+export type ServerCarriedContext = Pick<
+  ServerContext,
+  "user" | "session" | "metadata" | "abortSignal" | "abortController"
+>;
 
 /**
  * Server response object
@@ -622,6 +656,43 @@ export type ServerAgentRouteOptions = {
    * file or download that would overflow it stops mid-transfer.
    */
   maxInputTotalBytes?: number;
+  /**
+   * For a caller of `createAgentRoutes()` itself; with `registerAllRoutes()` /
+   * `createAllRoutes()` use `CreateRoutesOptions.perUserAuth` instead. The
+   * routes can only take identity from `ctx.user` if the server hands it to
+   * the handler, so a caller that registers them itself with this option must
+   * create the server with `carryMiddlewareState: true`; `registerAllRoutes()`
+   * does that for the server by itself.
+   *
+   * Set to `true` when the authentication middleware identifies individual
+   * people (one credential per person). The agent routes then take `userId`
+   * and the session only from the authenticated user (`ctx.user`,
+   * `ctx.session`) and ignore the request body's, on every adapter and for
+   * every request, so a caller cannot act as someone else. A request with no
+   * authenticated user gets no `userId` and no session, so with optional
+   * authentication anonymous callers never share a conversation. Any truthy
+   * value turns it on.
+   *
+   * **A server with per-person authentication must set this.** Left at the
+   * default (`false`) identity resolves as it always has: requests choose
+   * `userId` and `sessionId` in the body, so any authenticated caller can name
+   * another person there and act as them. The one exception is Hono, where a
+   * request whose client sent its own `X-Request-ID` header reaches the
+   * handler with the middleware's context, and an authenticated `ctx.user`
+   * (and `ctx.session`) wins over the body, as before, and so does it on a
+   * context the built-in adapters did not build (your own adapter, a handler
+   * called directly). Only this flag gives the guard on every adapter and
+   * every request. The routes log one warning per instance the first time a
+   * request served from the body names a different `userId` than a `ctx.user`
+   * that is not marked `shared: true`; the body's `userId` is still used.
+   *
+   * Leave it unset for no authentication or one shared API key, such as
+   * `neurolink serve` with `NEUROLINK_SERVER_API_KEY`: a shared key names no
+   * person, so requests choose `userId` and `sessionId` in the body. Middleware
+   * for a shared key should set `shared: true` on the `AuthenticatedUser` it
+   * returns, which keeps the warning quiet (the CLI's key middleware does).
+   */
+  perUserAuth?: boolean;
 };
 
 /**
@@ -987,6 +1058,15 @@ export type WebSocketRequestId = string | number;
  */
 export type AuthenticatedUser = {
   id: string;
+  /**
+   * `true` when this identity stands for every holder of one credential, such
+   * as a shared API key, rather than for one person. The agent routes then do
+   * not warn when a request names a different `userId` in its body: with a
+   * shared key every caller is one trust domain and the body is how callers
+   * keep separate conversation memory. Middleware that sets one fixed user for
+   * everyone holding a key should set this; per-person middleware should not.
+   */
+  shared?: boolean;
   email?: string;
   name?: string;
   roles?: string[];
@@ -1381,6 +1461,13 @@ export type AuthResult = {
   /** User roles (optional) */
   roles?: string[];
 
+  /**
+   * `true` when this identity stands for every holder of one credential, such
+   * as a shared API key, rather than one person. Carried to `ctx.user.shared`;
+   * see `AuthenticatedUser.shared`.
+   */
+  shared?: boolean;
+
   /** Additional user data */
   metadata?: Record<string, unknown>;
 };
@@ -1506,9 +1593,42 @@ export type CreateRoutesOptions = {
   /**
    * Options for the agent routes (`POST <basePath>/agent/execute` and
    * `/agent/stream`): where local-path attachments may be read from, and how
-   * large an attachment may be.
+   * large an attachment may be. Whose identity the routes trust is decided by
+   * the top-level `perUserAuth`, which is why it is not accepted here.
    */
-  agent?: ServerAgentRouteOptions;
+  agent?: Omit<ServerAgentRouteOptions, "perUserAuth">;
+  /**
+   * Set to `true` when the authentication middleware identifies individual
+   * people (one credential per person). The agent routes then take `userId`
+   * and the session only from the authenticated user and ignore the request
+   * body's, on every adapter and for every request; a request with no
+   * authenticated user gets neither. Any truthy value turns it on.
+   *
+   * **A server with per-person authentication must set this.** Left at the
+   * default (`false`) requests choose `userId` and `sessionId` in the body, so
+   * any authenticated caller can name another person there and act as them.
+   * The one exception is Hono, where a request whose client sent its own
+   * `X-Request-ID` header reaches the handler with the middleware's context and
+   * an authenticated `ctx.user` wins over the body, as before, and so on a
+   * context the built-in adapters did not build (your own adapter, a handler
+   * called directly); only this flag gives the guard everywhere. The first time
+   * a request served from the body names a different `userId` than its
+   * `ctx.user`, the routes log a warning (once per instance). Leave it unset
+   * for no authentication or one shared
+   * API key, such as `neurolink serve` with `NEUROLINK_SERVER_API_KEY`:
+   * requests choose `userId` and `sessionId` in the body. Middleware for a
+   * shared key should set `shared: true` on the `AuthenticatedUser` it
+   * returns, which keeps the warning quiet.
+   *
+   * This is the one switch for a server built with `registerAllRoutes` /
+   * `createAllRoutes`: every route group that scopes by identity reads it from
+   * here, so it cannot be set for the agent routes alone. `registerAllRoutes`
+   * also turns on the server's `carryMiddlewareState` when this is set, since
+   * the routes need the user in the handler; `createAllRoutes` returns route
+   * groups only, so a caller that registers them itself must create the server
+   * with `carryMiddlewareState: true`.
+   */
+  perUserAuth?: boolean;
 };
 
 // =============================================================================

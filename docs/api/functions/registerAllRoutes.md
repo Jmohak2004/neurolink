@@ -10,6 +10,12 @@
 
 Register all routes with a server adapter
 
+With `options.perUserAuth` this also turns on the adapter's
+`carryMiddlewareState` (`enableMiddlewareStateCarry()`): the agent routes can
+only take identity from `ctx.user` if the adapter hands the handler what
+authentication middleware set. An adapter without that method carries state
+itself, or the routes see no user.
+
 ## Parameters
 
 ### adapter
@@ -21,6 +27,10 @@ Register all routes with a server adapter
 #### listRoutes?
 
 () => [`RouteDefinition`](../type-aliases/RouteDefinition.md)[]
+
+#### enableMiddlewareStateCarry?
+
+() => `void`
 
 ### basePath?
 

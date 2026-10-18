@@ -245,7 +245,31 @@ While a tool runs inside `stream()`, no audio is produced. To avoid dead air, in
 
 ## Usage Example
 
-> The integration is exposed under `@juspay/neurolink/livekit`. LiveKit dependencies are optional/peer dependencies and are only required when the voice agent is used.
+> The integration is exposed under `@juspay/neurolink/livekit`.
+
+### Requirements
+
+The `@juspay/neurolink/livekit` entry **requires `@livekit/agents`**. Its
+functions take LiveKit's `JobContext` and run inside a worker where the SDK is
+installed, so its type declarations import types from `@livekit/agents`.
+`@livekit/agents`, the `@livekit/agents-plugin-*` packages and
+`@livekit/rtc-node` are `optionalDependencies` of `@juspay/neurolink`: a default
+`npm install` installs them, and `npm install --omit=optional` does not.
+
+- **Installed without optional dependencies.** Type-checking a file that
+  imports `@juspay/neurolink/livekit` fails with
+  `TS2307: Cannot find module '@livekit/agents'`. Install `@livekit/agents` in
+  the project that uses this entry, or do not import the entry. The other
+  entries of the package do not need it.
+- **`@types/node` range.** With `strict` on and `skipLibCheck` off, the LiveKit
+  packages' own declarations compile cleanly on `@types/node` 22 and 24.19.2,
+  the versions this was measured on. On `@types/node` 25 (25.9.9) and 26
+  (26.6.5) two third-party declarations fail:
+  `node_modules/@livekit/agents/dist/worker.d.ts` (TS2344) and
+  `node_modules/@livekit/rtc-node/dist/audio_stream.d.ts` (TS2416). They are
+  not NeuroLink's files and NeuroLink cannot fix them; set `skipLibCheck: true`,
+  or stay on `@types/node` 22 or 24.19.2, in the project that imports this
+  entry.
 
 LiveKit runs each call as a Job in its **own child process** and re-imports the
 agent entry file there. Because a live object cannot cross that process

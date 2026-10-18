@@ -32,6 +32,16 @@
  *      WRONG_USAGES. The last one only fails while the provider's return type is
  *      a real element type, so it also notices that type decaying to `any`.
  *
+ * An entry that REQUIRES an optional package (ENTRY_REQUIREMENTS) is not defective
+ * where that package is absent: `./livekit` takes LiveKit's `JobContext` and runs
+ * inside a worker that has `@livekit/agents` installed, so its declarations import
+ * it. In a case that omits optional dependencies such an entry is left out of the
+ * program and printed as SKIPPED-REQUIRES with the package name; where optional
+ * dependencies are installed it is checked like any other. What decides is the
+ * package being absent from the consumer's node_modules, not the case id, and a
+ * requirement that is absent in a case that did not omit optional dependencies
+ * fails the case.
+ *
  * Who owns an error decides what happens to it:
  *
  *   - In a file of this package, or in the consumer's own files: the suite fails,
@@ -132,6 +142,26 @@ const CASES: readonly ConsumerCase[] = [
   { id: "node22-omit-optional", typesNode: "22", omitOptional: true },
 ];
 
+type EntryRequirement = {
+  /** The exports key, such as "./livekit". */
+  readonly entry: string;
+  /** The optional package whose types the entry's declarations import. */
+  readonly requires: string;
+  readonly reason: string;
+};
+
+// Entries meant to be used only where an optional package is installed. Not a
+// place to park a declaration that leaks an optional package by mistake: the
+// fix for that is a structural type in src/lib/types, as for exceljs.
+const ENTRY_REQUIREMENTS: readonly EntryRequirement[] = [
+  {
+    entry: "./livekit",
+    requires: "@livekit/agents",
+    reason:
+      "its functions take LiveKit's JobContext and run inside a worker that has the SDK installed",
+  },
+];
+
 type KnownFailure = {
   readonly case: string;
   /** The TypeScript error code, such as "TS2344". */
@@ -142,32 +172,12 @@ type KnownFailure = {
   readonly issue: 1999;
 };
 
-// Defects that existed when this gate was added and have no fix yet. A fix
-// deletes its entry in the same change (a fixed defect fails the ratchet).
-// Never add to this list to make a red run green.
-const KNOWN_FAILURES: readonly KnownFailure[] = [
-  {
-    case: "node22-omit-optional",
-    code: "TS2307",
-    pathPrefix: "dist/voice/livekit/realtimeMcpTools.d.ts",
-    reason: "the declaration imports @livekit/agents, an optional dependency",
-    issue: 1999,
-  },
-  {
-    case: "node22-omit-optional",
-    code: "TS2307",
-    pathPrefix: "dist/voice/livekit/realtimeVoiceAgent.d.ts",
-    reason: "the declaration imports @livekit/agents, an optional dependency",
-    issue: 1999,
-  },
-  {
-    case: "node22-omit-optional",
-    code: "TS2307",
-    pathPrefix: "dist/voice/livekit/voiceAgent.d.ts",
-    reason: "the declaration imports @livekit/agents, an optional dependency",
-    issue: 1999,
-  },
-];
+// Defects that exist and have no fix yet. A fix deletes its entry in the same
+// change (a fixed defect fails the ratchet). Never add to this list to make a red
+// run green. Empty: the three TS2307 for @livekit/agents under --omit=optional
+// were not defects of the declarations but a requirement of the ./livekit entry,
+// which ENTRY_REQUIREMENTS now states.
+const KNOWN_FAILURES: readonly KnownFailure[] = [];
 
 type WrongUsage = {
   readonly name: string;
@@ -362,11 +372,17 @@ const firstWildcardMatch = (
     : hit.slice(stem.length, hit.length - after.length);
 };
 
+type ExportEntry = {
+  /** The exports key: "." or a subpath such as "./livekit", or a wildcard pattern. */
+  readonly key: string;
+  readonly specifier: string;
+};
+
 /** One import specifier per `types` entry of the exports map; a wildcard becomes one concrete file. */
-const exportSpecifiers = (
+const exportEntries = (
   packageRoot: string,
   manifest: unknown,
-): { readonly specifiers: readonly string[]; readonly typed: number } => {
+): { readonly entries: readonly ExportEntry[]; readonly typed: number } => {
   const exportsMap = isRecord(manifest) ? manifest.exports : undefined;
   const typedEntries = Object.entries(isRecord(exportsMap) ? exportsMap : {})
     .flatMap(([key, value]) =>
@@ -375,16 +391,74 @@ const exportSpecifiers = (
         : [],
     )
     .filter(({ key }) => key !== "./package.json");
-  const specifiers = typedEntries.flatMap(({ key, types }) => {
+  const entries = typedEntries.flatMap(({ key, types }): ExportEntry[] => {
     if (!key.includes("*")) {
-      return [key === "." ? PACKAGE_NAME : `${PACKAGE_NAME}${key.slice(1)}`];
+      return [
+        {
+          key,
+          specifier:
+            key === "." ? PACKAGE_NAME : `${PACKAGE_NAME}${key.slice(1)}`,
+        },
+      ];
     }
     const name = firstWildcardMatch(packageRoot, types);
     return name === undefined
       ? []
-      : [`${PACKAGE_NAME}${replaceEvery(key.slice(1), "*", name)}`];
+      : [
+          {
+            key,
+            specifier: `${PACKAGE_NAME}${replaceEvery(key.slice(1), "*", name)}`,
+          },
+        ];
   });
-  return { specifiers, typed: typedEntries.length };
+  return { entries, typed: typedEntries.length };
+};
+
+type SkippedEntry = ExportEntry & { readonly requires: string };
+
+type EntrySplit = {
+  readonly checked: readonly ExportEntry[];
+  readonly skipped: readonly SkippedEntry[];
+};
+
+/**
+ * Splits the export entries into those to type-check and those skipped because
+ * they require an optional package that is not installed. An entry is skipped only
+ * when its requirement is absent AND the case omitted optional dependencies: the
+ * same absence in a case that installed them is a broken install, so it throws
+ * rather than hiding the entry. A requirement that names an entry the package does
+ * not export throws too, so a rename cannot turn the map into a silent no-op.
+ */
+const splitByRequirement = (
+  entries: readonly ExportEntry[],
+  requirements: readonly EntryRequirement[],
+  omitOptional: boolean,
+  isInstalled: (packageName: string) => boolean,
+): EntrySplit => {
+  for (const requirement of requirements) {
+    if (!entries.some((entry) => entry.key === requirement.entry)) {
+      throw new Error(
+        "ENTRY_REQUIREMENTS names an exports entry that the package does not have",
+      );
+    }
+  }
+  const checked: ExportEntry[] = [];
+  const skipped: SkippedEntry[] = [];
+  for (const entry of entries) {
+    const requirement = requirements.find(
+      (candidate) => candidate.entry === entry.key,
+    );
+    if (requirement === undefined || isInstalled(requirement.requires)) {
+      checked.push(entry);
+    } else if (omitOptional) {
+      skipped.push({ ...entry, requires: requirement.requires });
+    } else {
+      throw new Error(
+        "an entry's required optional package is not installed although optional dependencies were not omitted",
+      );
+    }
+  }
+  return { checked, skipped };
 };
 
 const importProgram = (specifiers: readonly string[]): string =>
@@ -406,7 +480,7 @@ type TscRun = {
 };
 
 // Counted across cases and printed once, just before the harness summary.
-const tally = { expected: 0, thirdParty: 0 };
+const tally = { expected: 0, thirdParty: 0, skipped: 0 };
 
 type CaseState = {
   consumer: Consumer | undefined;
@@ -452,19 +526,36 @@ const installConsumer = (testCase: ConsumerCase, tarball: string): Consumer => {
     console.error(`    | ${install.stderr.trim().slice(-600)}`);
     throw new Error("npm install of the tarball did not complete");
   }
-  const { specifiers, typed } = exportSpecifiers(
+  const { entries, typed } = exportEntries(
     packageRoot,
     readJson(join(packageRoot, "package.json")),
   );
-  assert(
-    specifiers.length > 0 && specifiers.length === typed,
-    "an exports entry with a types condition produced no import to check",
+  const { checked, skipped } = splitByRequirement(
+    entries,
+    ENTRY_REQUIREMENTS,
+    testCase.omitOptional,
+    (packageName) =>
+      existsSync(
+        join(dir, "node_modules", ...packageName.split("/"), "package.json"),
+      ),
   );
+  const specifiers = checked.map((entry) => entry.specifier);
+  assert(
+    specifiers.length > 0 && specifiers.length + skipped.length === typed,
+    "an exports entry with a types condition produced no import to check, or was dropped without being named",
+  );
+  for (const entry of skipped) {
+    tally.skipped += 1;
+    log(
+      `  SKIPPED-REQUIRES [${testCase.id}] ${entry.key} requires ${entry.requires}, which is not installed (optional dependencies omitted)`,
+      "yellow",
+    );
+  }
   const nodeTypes = readJson(
     join(dir, "node_modules", "@types", "node", "package.json"),
   );
   log(
-    `  [${testCase.id}] installed @types/node ${isRecord(nodeTypes) ? String(nodeTypes.version) : "?"}, ${specifiers.length} export entries`,
+    `  [${testCase.id}] installed @types/node ${isRecord(nodeTypes) ? String(nodeTypes.version) : "?"}, ${specifiers.length} export entries checked, ${skipped.length} skipped`,
     "blue",
   );
   const program = importProgram(specifiers);
@@ -706,6 +797,102 @@ await runSuite(async () => {
     );
   });
 
+  await test("ENTRY_REQUIREMENTS names real exports entries and optional dependencies, once each", () => {
+    const manifest = readJson(join(REPO_ROOT, "package.json"));
+    const exportsMap = isRecord(manifest) ? manifest.exports : undefined;
+    const typedKeys = Object.entries(isRecord(exportsMap) ? exportsMap : {})
+      .filter(([, value]) => isRecord(value) && typeof value.types === "string")
+      .map(([key]) => key);
+    const optionalDependencies =
+      isRecord(manifest) && isRecord(manifest.optionalDependencies)
+        ? Object.keys(manifest.optionalDependencies)
+        : [];
+    assert(
+      ENTRY_REQUIREMENTS.every((requirement) =>
+        typedKeys.includes(requirement.entry),
+      ),
+      "ENTRY_REQUIREMENTS names an entry that package.json does not export with a types condition",
+    );
+    assert(
+      ENTRY_REQUIREMENTS.every((requirement) =>
+        optionalDependencies.includes(requirement.requires),
+      ),
+      "ENTRY_REQUIREMENTS requires a package that is not an optionalDependency, so it would never be absent",
+    );
+    assert(
+      new Set(ENTRY_REQUIREMENTS.map((requirement) => requirement.entry))
+        .size === ENTRY_REQUIREMENTS.length,
+      "ENTRY_REQUIREMENTS names the same entry twice",
+    );
+  });
+
+  await test("control: an entry is skipped when its requirement is absent, and only then", () => {
+    const entries: readonly ExportEntry[] = [
+      { key: ".", specifier: PACKAGE_NAME },
+      { key: "./livekit", specifier: `${PACKAGE_NAME}/livekit` },
+    ];
+    const requirements: readonly EntryRequirement[] = [
+      { entry: "./livekit", requires: "@livekit/agents", reason: "sample" },
+    ];
+    const absent = splitByRequirement(entries, requirements, true, () => false);
+    assert(
+      absent.skipped.map((entry) => entry.key).join() === "./livekit" &&
+        absent.skipped[0].requires === "@livekit/agents" &&
+        absent.checked.map((entry) => entry.key).join() === ".",
+      "an entry with an absent requirement was not skipped and named, or an entry without one was skipped",
+    );
+    const present = splitByRequirement(
+      entries,
+      requirements,
+      true,
+      (packageName) => packageName === "@livekit/agents",
+    );
+    assert(
+      present.skipped.length === 0 && present.checked.length === 2,
+      "an entry whose requirement is present was skipped",
+    );
+    const kept = splitByRequirement(entries, requirements, false, () => true);
+    assert(
+      kept.skipped.length === 0 && kept.checked.length === 2,
+      "an entry was skipped in a case that kept optional dependencies",
+    );
+  });
+
+  await test("control: a requirement that is absent without --omit=optional, or names a missing entry, fails loudly", () => {
+    const entries: readonly ExportEntry[] = [
+      { key: ".", specifier: PACKAGE_NAME },
+      { key: "./livekit", specifier: `${PACKAGE_NAME}/livekit` },
+    ];
+    const sample: EntryRequirement = {
+      entry: "./livekit",
+      requires: "@livekit/agents",
+      reason: "sample",
+    };
+    const throws = (run: () => unknown): boolean => {
+      try {
+        run();
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    assert(
+      throws(() => splitByRequirement(entries, [sample], false, () => false)),
+      "an absent requirement was skipped in a case that did not omit optional dependencies",
+    );
+    assert(
+      throws(() =>
+        splitByRequirement(
+          entries,
+          [{ ...sample, entry: "./no-such-entry" }],
+          true,
+          () => false,
+        ),
+      ),
+      "a requirement naming an entry that does not exist was accepted",
+    );
+  });
+
   await test("each wrong usage differs from the good one", () => {
     assert(
       WRONG_USAGES.every((wrong) => wrong.source !== GOOD_USAGE),
@@ -848,7 +1035,7 @@ await runSuite(async () => {
 
   logSection("Expected failures and third-party errors");
   log(
-    `  ${tally.expected} EXPECTED FAILURE(S) from KNOWN_FAILURES, ${tally.thirdParty} third-party error(s) listed`,
+    `  ${tally.expected} EXPECTED FAILURE(S) from KNOWN_FAILURES, ${tally.thirdParty} third-party error(s) listed, ${tally.skipped} export entr(ies) SKIPPED-REQUIRES`,
     "yellow",
   );
 });

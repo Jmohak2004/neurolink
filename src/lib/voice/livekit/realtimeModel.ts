@@ -15,7 +15,7 @@
  */
 
 import type { RealtimeLlm, RealtimeVoiceConfig } from "../../types/index.js";
-import { requireNoCleartextCrossHost } from "./config.js";
+import { requireWebSocketUrl } from "./config.js";
 
 /**
  * Fail early, naming the variable, when `XAI_API_KEY` is blank or absent.
@@ -71,9 +71,11 @@ async function createXaiRealtimeLlm(
 ): Promise<RealtimeLlm> {
   requireXaiApiKey();
   // `cfg` can be built by hand, without `resolveRealtimeVoiceConfig`, so the
-  // key-leak check runs here as well as there.
+  // whole base URL check runs here as well as there: the ws or wss shape, and
+  // the cross-host rule that keeps XAI_API_KEY off an unencrypted link. The
+  // cross-host rule alone lets an http(s) or unparseable value reach the plugin.
   if (cfg.xaiBaseURL) {
-    requireNoCleartextCrossHost(cfg.xaiBaseURL, "xaiBaseURL");
+    requireWebSocketUrl(cfg.xaiBaseURL, "xaiBaseURL");
   }
   const xai = await import("@livekit/agents-plugin-xai");
 
@@ -101,9 +103,12 @@ async function createXaiRealtimeLlm(
  * The gemini branch builds exactly what the agent has always built: Vertex AI,
  * the configured model, transcripts of both sides, and project, location,
  * voice and modality when set. The xai branch needs `XAI_API_KEY` in the
- * environment and throws before touching the plugin when it is missing. It also
- * throws before touching the plugin for a `ws://` base URL to a host other than
- * loopback, unless `XAI_REALTIME_ALLOW_INSECURE=true`, as config resolution does.
+ * environment and throws before touching the plugin when it is missing. It then
+ * checks `xaiBaseURL` as config resolution does, and throws before touching the
+ * plugin for a value that is not a `ws://` or `wss://` URL, and for a `ws://`
+ * URL to a host other than localhost, 127.0.0.0/8 or [::1] unless
+ * `XAI_REALTIME_ALLOW_INSECURE=true`. That opt-in never admits a value that is
+ * not a ws or wss URL. The errors name `xaiBaseURL` and do not repeat the value.
  */
 export async function createRealtimeLlm(
   cfg: RealtimeVoiceConfig,

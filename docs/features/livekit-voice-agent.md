@@ -724,9 +724,10 @@ factory the agent uses. It returns the LiveKit realtime model for
 neither plugin unless the realtime agent runs. It takes a complete
 `RealtimeVoiceConfig` (build one with `resolveRealtimeVoiceConfig()`), throws
 when the xai backend is chosen and `XAI_API_KEY` is unset, throws when the xai
-backend is given a `ws://` `xaiBaseURL` to a host other than loopback without
-`XAI_REALTIME_ALLOW_INSECURE=true` (a hand-built config gets the same refusal as
-config resolution), and does **not** run
+backend is given an `xaiBaseURL` that is not a `ws://` or `wss://` URL or is a
+`ws://` URL to a host other than loopback without `XAI_REALTIME_ALLOW_INSECURE=true`
+(a hand-built config gets the same two refusals as config resolution, and the
+opt-in never admits a value that is not a ws or wss URL), and does **not** run
 the Vertex helpers (`ensureVertexAdc`, `clearGeminiApiKeyEnv`) for gemini: only
 the agent entry does, so a caller using the factory directly has to set up
 Google credentials itself.
@@ -802,8 +803,8 @@ owner is the missing step.
   for gemini.
 - `XAI_API_KEY is not set`: set it in the worker's environment. The check also
   rejects a whitespace-only value.
-- `XAI_REALTIME_BASE_URL must be a ws:// or wss:// URL`: use a WebSocket URL,
-  not an `https://` one.
+- `XAI_REALTIME_BASE_URL must be a ws:// or wss:// URL` (or the same for
+  `xaiBaseURL`): use a WebSocket URL, not an `https://` one.
 - `XAI_REALTIME_BASE_URL is a ws:// URL to a host other than localhost, ...` (or
   the same for `xaiBaseURL`): the URL would send `XAI_API_KEY` unencrypted to a
   host that is not loopback. Use a `wss://` URL. Only if the path to that host is

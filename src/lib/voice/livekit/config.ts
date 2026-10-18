@@ -162,7 +162,7 @@ function isLoopbackHost(hostname: string): boolean {
  * check. The error names the setting and the opt-in and does not repeat the
  * value.
  */
-export function requireNoCleartextCrossHost(value: string, name: string): void {
+function requireNoCleartextCrossHost(value: string, name: string): void {
   const url = parseWebSocketUrl(value);
   if (
     url?.protocol === "ws:" &&
@@ -175,8 +175,13 @@ export function requireNoCleartextCrossHost(value: string, name: string): void {
   }
 }
 
-/** A ws or wss URL that passes `requireNoCleartextCrossHost`. The error names the setting and does not repeat the value. */
-function requireWebSocketUrl(value: string, name: string): string {
+/**
+ * A ws or wss URL that passes `requireNoCleartextCrossHost`. The error names the
+ * setting and does not repeat the value. Exported so the model factory applies
+ * the same check to a hand-built config as config resolution applies to the
+ * variable and to a caller's override.
+ */
+export function requireWebSocketUrl(value: string, name: string): string {
   if (parseWebSocketUrl(value) === undefined) {
     throw new Error(`${name} must be a ws:// or wss:// URL`);
   }

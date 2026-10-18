@@ -1570,6 +1570,61 @@ async function xaiStubSection(): Promise<void> {
     );
   });
 
+  await test("xai factory with a hand-built config: a base URL that is not a ws:// or wss:// URL is refused, with or without XAI_REALTIME_ALLOW_INSECURE, and the error names xaiBaseURL without repeating the value", async () => {
+    // The cross-host rule alone lets an http(s) or unparseable value through to
+    // the plugin, which is handed XAI_API_KEY as well. The opt-in only ever
+    // covers a ws:// URL, so it must not admit any of these.
+    const before = process.env.XAI_REALTIME_ALLOW_INSECURE;
+    const base = await resolveConfig({ VOICE_REALTIME_BACKEND: "xai" });
+    const build = (url: string) =>
+      livekit.createRealtimeLlm({ ...base, xaiBaseURL: url });
+    const marker = "canary-base-url-value";
+    const notWebSocket = [
+      `https://gateway.example.test/v1/${marker}`,
+      `http://gateway.example.test/v1/${marker}`,
+      `http://127.0.0.1:9/v1/${marker}`,
+      `ftp://gateway.example.test/v1/${marker}`,
+      `gateway.example.test/v1/${marker}`,
+      `not a url ${marker}`,
+    ];
+
+    for (const optIn of [undefined, "true"]) {
+      for (const url of notWebSocket) {
+        const message = await withEnv(
+          { XAI_API_KEY: STUB_BEARER, XAI_REALTIME_ALLOW_INSECURE: optIn },
+          () => rejection(() => build(url)),
+        );
+        assert(
+          message.includes("xaiBaseURL"),
+          "the error does not name xaiBaseURL",
+        );
+        assert(
+          !message.includes(marker) &&
+            !message.includes("gateway.example.test") &&
+            !message.includes(STUB_BEARER),
+          "the error repeats the refused value, its host or the key",
+        );
+        assert(
+          !message.includes("XAI_REALTIME_ALLOW_INSECURE"),
+          "the error offers the opt-in for a value it cannot admit",
+        );
+      }
+    }
+
+    const noKey = await withEnv({}, () =>
+      rejection(() => build(notWebSocket[0])),
+    );
+    assert(
+      noKey.includes("XAI_API_KEY") && !noKey.includes("xaiBaseURL"),
+      "a missing key was not reported before the base URL",
+    );
+
+    assert(
+      process.env.XAI_REALTIME_ALLOW_INSECURE === before,
+      "XAI_REALTIME_ALLOW_INSECURE was not restored",
+    );
+  });
+
   await test("xai plugin against a stub: an MCP tool goes through buildRealtimeMcpTools, so its union and untyped schema reach the wire sanitized", async () => {
     const mcp = await startMcpStub([
       {

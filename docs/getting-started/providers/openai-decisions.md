@@ -405,11 +405,14 @@ reads. A caller can always name it with `provider: "openai-decisions"`. So:
 - **None of TypeSafe, Laya, XOR, SubQ, Perplexity, Cloudflare Clef, OpenAI Decisions
   or ScaleDown configured:** everything behaves exactly as it did without a decision model.
 
-The classifier router's `auto` gate reads the credentials given to the
-`NeuroLink` constructor and the environment, not credentials passed on a single
-call, so a per-call `credentials.openaiDecisions` does not influence it. The
-other consumers NeuroLink wires itself (compaction and tool routing) call
-`tryDecide` without credentials too.
+The classifier router's `auto` gate counts the credentials given to the
+`NeuroLink` constructor, the environment and the request's own per-call
+credentials, so a `credentials.openaiDecisions` passed on a single call can make
+`auto` pick `jev`, and the decision then goes to that account. The other
+consumers NeuroLink wires itself that run inside a `generate()` or `stream()`
+call (tool routing and compaction) forward that call's `credentials` to the
+decision too. Compaction triggered by `compactSession()`, which has no request,
+uses the constructor's credentials and the environment.
 
 Where the built-in consumers use the default provider (what each one sends is
 listed in [What is sent to OpenAI](#what-is-sent-to-openai)):
@@ -820,9 +823,11 @@ cut to its scheme, host and path.
   in [What a reply must look like](#what-a-reply-must-look-like). The warning names
   the question and never quotes the reply.
 - **Built-in routing never uses OpenAI Decisions** — an earlier provider is also
-  configured and takes precedence, no key is set, or the router's `auto` gate did
-  not see the key: it reads the constructor's credentials and the environment, not
-  per-call credentials.
+  configured and takes precedence, no key is set where the router's `auto` gate
+  looks (it counts the constructor's credentials, the environment and the
+  request's own per-call credentials), or the environment key is a gateway's,
+  which the default skips (see
+  [A gateway's key](#a-gateways-key-is-never-used-for-the-default)).
 - **State is being sent to OpenAI and I only set the key for chat** — see
   [What is sent to OpenAI](#what-is-sent-to-openai) and
   [One key, two providers](#one-key-two-providers). Check the `.env` your process

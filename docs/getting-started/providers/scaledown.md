@@ -262,6 +262,13 @@ host set up on purpose. That reasoning does not cover ScaleDown, whose key
 belongs to no other provider: it was placed last, after OpenAI Decisions, as a
 deliberate choice and not by that rule. The effect is that an ambient `OPENAI_API_KEY`, `PERPLEXITY_API_KEY` or
 Cloudflare pair in the environment outranks a `SCALEDOWN_API_KEY` set on purpose.
+The one exception is a gateway's key: an `OPENAI_API_KEY` found only in the
+environment is skipped for the default while `OPENAI_BASE_URL`, `OPENAI_API_BASE`
+or `credentials.openai.baseURL` names a host other than `https://api.openai.com`,
+so with nothing earlier configured ScaleDown is the default. That skip does not
+apply when `OPENAI_DECISIONS_BASE_URL` is set or `credentials.openaiDecisions`
+supplies a key or a base URL; OpenAI Decisions then outranks ScaleDown again (see
+[A gateway's key](openai-decisions.md#a-gateways-key-is-never-used-for-the-default)).
 A host that wants ScaleDown for the built-in features must not have the earlier
 providers configured, or must name it in its own calls.
 

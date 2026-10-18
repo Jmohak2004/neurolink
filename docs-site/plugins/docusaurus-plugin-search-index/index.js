@@ -11,6 +11,7 @@ const matter = require("gray-matter");
 const { createHash } = require("node:crypto");
 const { parseHeadingId } = require("./headingId");
 const { truncateAtBoundary } = require("./truncate");
+const { stripMarkdown } = require("./stripMarkdown");
 
 /** Simple glob matching for exclude patterns */
 function matchGlob(glob, filePath) {
@@ -24,62 +25,6 @@ function matchGlob(glob, filePath) {
     .replace(/\*\*/g, ".*") // ** alone matches anything
     .replace(/\*/g, "[^/]*"); // * matches within single segment
   return new RegExp("^" + regexStr + "$").test(filePath);
-}
-
-const CODE_MARK = String.fromCharCode(0);
-const CODE_PLACEHOLDER = new RegExp(`${CODE_MARK}(\\d+)${CODE_MARK}`, "g");
-
-/** Strip markdown syntax to get plain text */
-function stripMarkdown(content) {
-  // Inline code holds exactly what people search for — commands, env vars, API
-  // names — so its text is kept. It is parked behind a placeholder until the
-  // end because the passes below would damage it: the tag pass drops `<file>`
-  // and the emphasis pass collapses `OPENAI_API_KEY` to "OPENAIAPIKEY". The
-  // placeholder is an index between NUL characters: none of those passes
-  // matches NUL, and Markdown source never contains it, so document text
-  // cannot be mistaken for a placeholder on restore.
-  const codeSpans = [];
-  let result = content
-    // Remove code blocks
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(
-      /`([^`]*)`/g,
-      (_, code) => `${CODE_MARK}${codeSpans.push(code) - 1}${CODE_MARK}`,
-    )
-    // Remove images
-    .replace(/!\[.*?\]\(.*?\)/g, "")
-    // Remove links but keep text
-    .replace(/\[([^\]]*)\]\(.*?\)/g, "$1");
-
-  // Iteratively strip HTML tags to handle nested/malformed tags
-  let prev;
-  do {
-    prev = result;
-    result = result.replace(/<[^>]*>/g, "");
-  } while (result !== prev);
-
-  return (
-    result
-      // Remove headings markers
-      .replace(/^#{1,6}\s+/gm, "")
-      // Remove bold/italic
-      .replace(/(\*{1,3}|_{1,3})(.*?)\1/g, "$2")
-      // Remove blockquotes
-      .replace(/^>\s+/gm, "")
-      // Remove horizontal rules
-      .replace(/^[-*_]{3,}\s*$/gm, "")
-      // Remove list markers
-      .replace(/^[\s]*[-*+]\s+/gm, "")
-      .replace(/^[\s]*\d+\.\s+/gm, "")
-      // Remove MDX imports/exports
-      .replace(/^(import|export)\s+.*$/gm, "")
-      // Remove admonitions
-      .replace(/^:::.*$/gm, "")
-      // Collapse whitespace
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(CODE_PLACEHOLDER, (_, i) => codeSpans[Number(i)])
-      .trim()
-  );
 }
 
 /**

@@ -238,10 +238,9 @@ configures it and there is no base URL to set. NeuroLink calls
 can equally come from the config passed to the SDK,
 `new NeuroLink({ credentials: { openaiDecisions: { apiKey } } })`, or per call;
 config set there counts when a `decide()` call picks the default decision
-provider, exactly as the environment does. The classifier router's `auto` gate is
-read differently: it looks at the constructor's credentials and the environment
-only, so a `credentials.openaiDecisions` passed on one call does not influence
-it. The provider id is `openai-decisions`: the `openai` provider is the chat
+provider, exactly as the environment does. The classifier router's `auto` gate
+counts them too, per-call credentials included, so a `credentials.openaiDecisions`
+passed on one call can make `auto` pick `jev`. The provider id is `openai-decisions`: the `openai` provider is the chat
 provider, which serves `generate()` and `stream()` and not `decide()`, and
 `credentials.openai` does not configure `decide`. Its wire is OpenAI's own (named
 questions in an array, an array of answers), so NeuroLink translates both ways;

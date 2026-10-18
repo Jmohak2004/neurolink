@@ -56,9 +56,8 @@ async function runOneExperiment() {
     },
     timeoutMs: 120_000,
   });
-  await worker.initialize("run1");
-
-  // Listen for events
+  // Attach the emitter and listeners before initialize(), which emits
+  // autoresearch:initialized (or autoresearch:resumed) itself
   const emitter = neurolink.getEventEmitter();
   worker.setEmitter(emitter);
   emitter.on("autoresearch:experiment-started", (e) => {
@@ -67,6 +66,8 @@ async function runOneExperiment() {
   emitter.on("autoresearch:experiment-completed", (e) => {
     console.log(`Experiment ${e.runCount}: ${e.status}, metric=${e.metric}`);
   });
+
+  await worker.initialize("run1");
 
   // Run one cycle
   const result = await worker.runExperimentCycle(

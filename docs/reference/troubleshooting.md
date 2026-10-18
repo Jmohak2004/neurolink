@@ -62,11 +62,11 @@ npx @juspay/neurolink generate "Test" --debug
 
 ### Guardrails Middleware
 
-| Issue                      | Solution                                                                                                                                                                                                            |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Content not being filtered | `preset: "security"` only turns guardrails on; also set `badWords` (with `enabled: true` and a `list`) or `modelFilter`. See [Guardrails Guide](../features/guardrails.md#problem-guardrails-not-filtering-content) |
-| Too many false positives   | Review bad word list, remove common words. See [Guardrails Guide](../features/guardrails.md#best-practices)                                                                                                         |
-| Model-based filter is slow | Switch to `openai:gpt-4o-mini` for faster filtering. See [Guardrails Guide](../features/guardrails.md#troubleshooting)                                                                                              |
+| Issue                      | Solution                                                                                                                                                                                                                                             |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Content not being filtered | `preset: "security"` only turns guardrails on; also set `badWords` (with `enabled: true` and a `list`) or `modelFilter`. See [Guardrails Guide](../features/guardrails.md#problem-guardrails-not-filtering-content)                                  |
+| Too many false positives   | Terms match as substrings, so a short term catches unrelated words. Use specific terms, or `regexPatterns` with `\b` word boundaries. See [Guardrails Guide](../features/guardrails.md#problem-too-many-false-positives-legitimate-content-filtered) |
+| Model-based filter is slow | Switch to `openai:gpt-4o-mini` for faster filtering. See [Guardrails Guide](../features/guardrails.md#troubleshooting)                                                                                                                               |
 
 ### Redis Conversation Export
 

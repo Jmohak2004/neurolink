@@ -11,7 +11,8 @@
  *
  * Three-valued result reporting:
  *   - PASS: test fn returns/resolves normally
- *   - FAIL: test fn throws an Error not matching the SKIP convention
+ *   - FAIL: test fn throws an Error not matching the SKIP convention, OR throws
+ *           a `HardFail`, which is never downgraded whatever its message says
  *   - SKIP: test fn throws `new Skip(reason)`, OR throws an error whose
  *           message starts with "SKIP:", OR — in a live suite only — throws
  *           a known provider error caught by isExpectedProviderError()
@@ -60,6 +61,27 @@ export class Skip extends Error {
   constructor(reason: string) {
     super(`SKIP: ${reason}`);
     this.name = "Skip";
+  }
+}
+
+/**
+ * A failure `test()` never turns into a skip, whatever its message says.
+ *
+ * In a live suite `test()` skips any error whose message matches
+ * `isExpectedProviderError()` (a 401, a 429, "API key", a rate limit). That is
+ * right while a credential error means "this account cannot run the test", and
+ * wrong once the suite has decided that the same error is the finding: a
+ * provider that has its secret and is answering 401 is broken, not unavailable.
+ * That decision cannot be carried by the message, because the message is the
+ * very thing the classifier reads, so it is carried by the type.
+ *
+ * Narrow on purpose: it changes the outcome only for an error thrown as this
+ * class. Every other error is classified exactly as before.
+ */
+export class HardFail extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HardFail";
   }
 }
 
@@ -668,9 +690,10 @@ export function defineSuite(
       // this gate, `security-suites` could go green with every offline case
       // downgraded to ⊘ — only an explicit `Skip` / `SKIP:` may skip here.
       const isSkip =
-        err instanceof Skip ||
-        msg.startsWith("SKIP:") ||
-        (defs.offline !== true && isExpectedProviderError(msg));
+        !(err instanceof HardFail) &&
+        (err instanceof Skip ||
+          msg.startsWith("SKIP:") ||
+          (defs.offline !== true && isExpectedProviderError(msg)));
       if (isSkip) {
         skipped++;
         const reason = msg.startsWith("SKIP:") ? msg.slice(5).trim() : msg;

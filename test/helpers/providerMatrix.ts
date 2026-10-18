@@ -151,6 +151,18 @@ export const CATALOG_COMPUTED_BASE_URL_IDS: readonly string[] = [
   ...computedBaseURLEnvVarById.keys(),
 ];
 
+/**
+ * Catalog provider ids whose JSON records a live-matrix run
+ * (`evidence.liveMatrix` is not null): someone ran this provider against its
+ * real API with a real key and wrote down the result, so the nightly sweep is
+ * expected to be able to authenticate to it.
+ */
+export const LIVE_MATRIX_EVIDENCE_IDS: ReadonlySet<string> = new Set(
+  CATALOG_JSON_ENTRIES.filter(
+    (entry) => entry.evidence.liveMatrix !== null,
+  ).map((entry) => entry.id),
+);
+
 export { CATALOG_PROVIDER_IDS, DECIDE_CATALOG_PROVIDER_IDS };
 
 /**
@@ -924,8 +936,19 @@ export function isNeverAutoAvailable(providerName: string): boolean {
  * reported as available. `--provider=bedrock` still force-includes it.
  */
 export function hasProviderEnv(providerName: string): boolean {
+  return (
+    !isNeverAutoAvailable(providerName) && hasProviderEnvVars(providerName)
+  );
+}
+
+/**
+ * `hasProviderEnv()` without the exclusion: true when the provider's env vars
+ * are populated even for a provider the matrix never auto-selects (Bedrock).
+ * The live gate uses it to tell "no secret" from "excluded by design".
+ */
+export function hasProviderEnvVars(providerName: string): boolean {
   const entry = PROVIDERS[providerName];
-  if (!entry || isNeverAutoAvailable(providerName)) {
+  if (!entry) {
     return false;
   }
   const [primaryEnvVar, ...remainingEnvVars] = entry.envVars;

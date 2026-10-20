@@ -2432,6 +2432,12 @@ export type ProxyEnvironmentSnapshot = {
   noProxy?: string;
 };
 
+/** Transport deadlines for a proxied upstream request. */
+export type ProxyTimeouts = {
+  headersTimeout?: number;
+  bodyTimeout?: number;
+};
+
 // =============================================================================
 // QUIET DETECTOR (from proxy/quietDetector.ts)
 // =============================================================================

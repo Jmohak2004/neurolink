@@ -420,6 +420,7 @@ import {
   getProxyTokenBudgetSessionKey,
 } from "../../proxy/proxyTokenBudget.js";
 import { observeAnthropicBudgetResponse } from "../../proxy/anthropicBudgetResponse.js";
+import { fetchProxyAware } from "../../proxy/proxyFetch.js";
 import {
   readCacheCreation1hTokens,
   oneHourCacheWriteFields,
@@ -556,11 +557,18 @@ async function fetchAnthropicUpstream(
       attempt: dispatch.attemptNumber,
       metadata: { upstreamMethod: "POST", upstreamUrl: url },
     });
-    const response = await fetch(url, {
-      ...init,
-      body: dispatchedBody,
-      dispatcher: upstreamDispatcher,
-    } as RequestInit);
+    const response = await fetchProxyAware(
+      url,
+      {
+        ...init,
+        body: dispatchedBody,
+      },
+      upstreamDispatcher,
+      {
+        headersTimeout: UPSTREAM_FETCH_TIMEOUT_MS,
+        bodyTimeout: UPSTREAM_FETCH_TIMEOUT_MS,
+      },
+    );
     return observeAnthropicBudgetResponse(
       response,
       lease,

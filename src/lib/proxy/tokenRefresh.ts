@@ -9,6 +9,7 @@ import {
 import { writeJsonSnapshotAtomically } from "./snapshotPersistence.js";
 import { withTimeout } from "../utils/async/withTimeout.js";
 import { redactUrlForError } from "../utils/logSanitize.js";
+import { fetchProxyAware } from "./proxyFetch.js";
 import type {
   RefreshableAccount,
   RefreshResult,
@@ -87,7 +88,7 @@ async function performTokenRefresh(
 
   for (const url of urls) {
     try {
-      const resp = await fetch(url, {
+      const resp = await fetchProxyAware(url, {
         method: "POST",
         headers,
         body: requestBody,

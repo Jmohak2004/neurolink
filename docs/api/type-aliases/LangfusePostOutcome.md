@@ -6,7 +6,7 @@
 
 # Type Alias: LangfusePostOutcome
 
-> **LangfusePostOutcome** = \{ `accepted`: `true`; `rejected`: `number`; \} \| \{ `accepted`: `false`; \}
+> **LangfusePostOutcome** = \{ `accepted`: `true`; `rejected`: `number`; \} \| \{ `accepted`: `false`; `refused?`: `true`; \}
 
 ## Description
 

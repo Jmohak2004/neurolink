@@ -6,7 +6,7 @@
 
 # Type Alias: OtlpAnyValue
 
-> **OtlpAnyValue** = \{ `boolValue`: `boolean`; \} \| \{ `intValue`: `string`; \} \| \{ `doubleValue`: `number`; \} \| \{ `stringValue`: `string`; \} \| \{ `arrayValue`: \{ `values`: `OtlpAnyValue`[]; \}; \}
+> **OtlpAnyValue** = \{ `boolValue`: `boolean`; \} \| \{ `intValue`: `number`; \} \| \{ `doubleValue`: `number`; \} \| \{ `stringValue`: `string`; \} \| \{ `arrayValue`: \{ `values`: `OtlpAnyValue`[]; \}; \}
 
 ## Description
 

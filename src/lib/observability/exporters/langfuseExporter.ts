@@ -1,4 +1,5 @@
 import {
+  CREDENTIALS_WARN_INTERVAL_MS,
   DEFAULT_BASE_URL,
   DEFAULT_FLUSH_AT,
   DEFAULT_FLUSH_BUDGET_MS,
@@ -37,7 +38,6 @@ import {
   reportDeliveriesWith,
 } from "./baseExporter.js";
 
-let credentialsWarned = false;
 let malformedRejectionLogged = false;
 
 function isRetryable(status: number): boolean {
@@ -118,6 +118,9 @@ export class LangfuseExporter extends BaseExporter {
   private lastDeliveryError: string | undefined;
   private unwarnedQueueDrops = 0;
   private lastQueueDropWarning = 0;
+  private unwarnedRefusals = 0;
+  private lastRefusalWarning = 0;
+  private credentialsRejected = false;
 
   /**
    * @description Creates an exporter for one Langfuse project.
@@ -131,7 +134,7 @@ export class LangfuseExporter extends BaseExporter {
     this.authorization = `Basic ${Buffer.from(
       `${langfuse.publicKey}:${langfuse.secretKey}`,
     ).toString("base64")}`;
-    this.baseUrl = (langfuse.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.baseUrl = (langfuse.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.flushBudgetMs =
       langfuse.flushBudgetMs !== undefined && langfuse.flushBudgetMs > 0
         ? langfuse.flushBudgetMs
@@ -297,6 +300,9 @@ export class LangfuseExporter extends BaseExporter {
         `[langfuse] Dropped ${stranded} spans still waiting at shutdown`,
       );
     }
+    if (this.unwarnedRefusals > 0) {
+      this.reportRefusals();
+    }
   }
 
   /**
@@ -342,6 +348,13 @@ export class LangfuseExporter extends BaseExporter {
     }
   }
 
+  private reportRefusals(): void {
+    logger.error(
+      `[langfuse] Langfuse credentials rejected; dropped ${this.unwarnedRefusals} spans`,
+    );
+    this.unwarnedRefusals = 0;
+  }
+
   private record(
     total: number,
     report: LangfuseDeliveryReport,
@@ -358,7 +371,7 @@ export class LangfuseExporter extends BaseExporter {
       report.delivered === 0 && failed > 0
         ? `Dropped ${failed} of ${total} spans: ${report.error ?? "Langfuse rejected every span"}`
         : report.error;
-    if (failed > 0) {
+    if (failed > report.refused) {
       logger.warn(`[langfuse] Dropped ${failed} of ${total} spans`, {
         error: report.error,
       });
@@ -389,6 +402,7 @@ export class LangfuseExporter extends BaseExporter {
     const report: LangfuseDeliveryReport = {
       delivered: 0,
       rejected: 0,
+      refused: 0,
       droppedIds: [],
     };
     for (const chunk of chunkOtlpSpans(items)) {
@@ -405,6 +419,9 @@ export class LangfuseExporter extends BaseExporter {
         } else {
           report.droppedIds.push(...chunk.map(({ span }) => span.spanId));
           report.error = "Langfuse did not accept the batch";
+          if (outcome.refused) {
+            report.refused += chunk.length;
+          }
         }
       } catch (error) {
         report.droppedIds.push(...chunk.map(({ span }) => span.spanId));
@@ -434,11 +451,14 @@ export class LangfuseExporter extends BaseExporter {
       ]),
     });
     if (response.status === 401 || response.status === 403) {
-      if (!credentialsWarned) {
-        credentialsWarned = true;
-        logger.warn("[langfuse] Langfuse credentials rejected");
+      this.credentialsRejected = true;
+      this.unwarnedRefusals += chunk.length;
+      const now = Date.now();
+      if (now - this.lastRefusalWarning >= CREDENTIALS_WARN_INTERVAL_MS) {
+        this.reportRefusals();
+        this.lastRefusalWarning = now;
       }
-      return { accepted: false };
+      return { accepted: false, refused: true };
     }
     if (isRetryable(response.status)) {
       const retryAfterMs =
@@ -453,6 +473,13 @@ export class LangfuseExporter extends BaseExporter {
     if (!response.ok) {
       logger.warn(`[langfuse] Export rejected with ${response.status}`);
       return { accepted: false };
+    }
+    if (this.credentialsRejected) {
+      logger.error(
+        `[langfuse] Langfuse credentials accepted again; dropped ${this.unwarnedRefusals} spans since the last warning`,
+      );
+      this.credentialsRejected = false;
+      this.unwarnedRefusals = 0;
     }
     // Langfuse took the request; a body that is not an object, or not JSON,
     // reports no rejections.

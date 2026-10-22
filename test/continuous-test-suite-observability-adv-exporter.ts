@@ -159,7 +159,7 @@ const ONLY = process.env.ADV_EXPORTER_ONLY?.split(",").map((id) => id.trim());
 
 type OtlpValue = {
   stringValue?: string;
-  intValue?: string;
+  intValue?: string | number;
   doubleValue?: number;
   boolValue?: boolean;
 };
@@ -184,7 +184,7 @@ function attrOf(
   const value = attributes?.find((entry) => entry.key === key)?.value;
   return (
     value?.stringValue ??
-    value?.intValue ??
+    (value?.intValue === undefined ? undefined : String(value.intValue)) ??
     (value?.doubleValue === undefined
       ? undefined
       : String(value.doubleValue)) ??

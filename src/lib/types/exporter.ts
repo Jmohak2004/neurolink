@@ -310,7 +310,7 @@ export type SpanAttributeValue = SpanAttributes[string];
 /** @description An OTLP/JSON attribute value. */
 export type OtlpAnyValue =
   | { boolValue: boolean }
-  | { intValue: string }
+  | { intValue: number }
   | { doubleValue: number }
   | { stringValue: string }
   | { arrayValue: { values: OtlpAnyValue[] } };
@@ -375,6 +375,7 @@ export type OtlpTraceRequest = {
 export type LangfuseDeliveryReport = {
   delivered: number;
   rejected: number;
+  refused: number;
   droppedIds: string[];
   error?: string;
 };
@@ -382,7 +383,7 @@ export type LangfuseDeliveryReport = {
 /** @description How Langfuse answered one export request: it took the spans (some perhaps rejected) or it did not take them. */
 export type LangfusePostOutcome =
   | { accepted: true; rejected: number }
-  | { accepted: false };
+  | { accepted: false; refused?: true };
 
 /** @description What the Langfuse exporter adds to, masks in and removes from span attributes before sending. */
 export type LangfuseAttributePolicy = Pick<

@@ -108,7 +108,7 @@ const CHILD_RESULT = "CHILD_RESULT ";
 
 type OtlpValue = {
   stringValue?: string;
-  intValue?: string;
+  intValue?: string | number;
   doubleValue?: number;
   boolValue?: boolean;
 };
@@ -144,7 +144,7 @@ function attrOf(attributes: OtlpKv[] | undefined, key: string) {
   const value = attributes?.find((entry) => entry.key === key)?.value;
   return (
     value?.stringValue ??
-    value?.intValue ??
+    (value?.intValue === undefined ? undefined : String(value.intValue)) ??
     (value?.doubleValue === undefined
       ? undefined
       : String(value.doubleValue)) ??

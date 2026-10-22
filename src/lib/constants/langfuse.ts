@@ -33,6 +33,9 @@ export const MAX_QUEUED_SPANS = 10_000;
 /** @description Milliseconds between warn-level logs about waiting spans dropped for lack of a delivery slot. */
 export const QUEUE_DROP_WARN_INTERVAL_MS = 60_000;
 
+/** @description Milliseconds between error-level logs about spans dropped because Langfuse rejected the credentials. */
+export const CREDENTIALS_WARN_INTERVAL_MS = 60_000;
+
 /** @description Longest `Retry-After` a 429 or 503 from Langfuse is waited out before the retry. */
 export const MAX_EXPORT_RETRY_AFTER_MS = 60_000;
 

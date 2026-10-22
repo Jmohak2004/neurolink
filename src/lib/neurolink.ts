@@ -4445,7 +4445,9 @@ Current user's request: ${currentInput}`;
           ? {
               enabled: hasProcessor,
               baseUrl:
-                langfuseOptions?.baseUrl ?? process.env.LANGFUSE_BASE_URL,
+                langfuseOptions?.baseUrl ||
+                process.env.LANGFUSE_BASE_URL ||
+                undefined,
               environment:
                 langfuseOptions?.environment ??
                 process.env.LANGFUSE_TRACING_ENVIRONMENT,

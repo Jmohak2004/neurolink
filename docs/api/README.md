@@ -3968,6 +3968,7 @@ console.log(result.content);
 - [validateQuery](functions/validateQuery.md)
 - [validateParams](functions/validateParams.md)
 - [createAgentWebSocketHandler](functions/createAgentWebSocketHandler.md)
+- [ensureTelemetry](functions/ensureTelemetry.md)
 - [flushOpenTelemetry](functions/flushOpenTelemetry.md)
 - [shutdownOpenTelemetry](functions/shutdownOpenTelemetry.md)
 - [isOpenTelemetryInitialized](functions/isOpenTelemetryInitialized.md)

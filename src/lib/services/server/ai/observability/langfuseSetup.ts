@@ -1,3 +1,4 @@
+import { DEFAULT_BASE_URL } from "../../../../constants/langfuse.js";
 import { OTEL_LOG_PREFIX } from "../../../../constants/telemetry.js";
 import { LangfuseExporter } from "../../../../observability/exporters/langfuseExporter.js";
 import type {
@@ -128,11 +129,17 @@ export function createLangfuseExporter(
     );
     return null;
   }
+  const baseUrl = options.baseUrl || process.env.LANGFUSE_BASE_URL || undefined;
+  if (baseUrl === undefined) {
+    logger.warn(
+      `${OTEL_LOG_PREFIX} Langfuse base URL is not set in observability.langfuse.baseUrl or LANGFUSE_BASE_URL; exporting to ${DEFAULT_BASE_URL}`,
+    );
+  }
   const exporter = new LangfuseExporter({
     enabled: true,
     publicKey,
     secretKey,
-    baseUrl: options.baseUrl ?? process.env.LANGFUSE_BASE_URL,
+    baseUrl,
     // The released build labelled Langfuse traces from the option and
     // LANGFUSE_TRACING_ENVIRONMENT / LANGFUSE_RELEASE only (the exporter reads
     // those two itself); the longer chain feeds the OTLP resource alone.

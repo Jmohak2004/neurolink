@@ -26,6 +26,12 @@ What one delivery attempt of a batch to Langfuse achieved.
 
 ---
 
+### refused
+
+> **refused**: `number`
+
+---
+
 ### droppedIds
 
 > **droppedIds**: `string`[]

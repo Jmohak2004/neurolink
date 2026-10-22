@@ -380,6 +380,7 @@ export { NeuroLink };
 // Observability configuration types
 
 import {
+  ensureTelemetry,
   flushOpenTelemetry,
   getLangfuseHealthStatus,
   isOpenTelemetryInitialized,
@@ -388,6 +389,7 @@ import {
 } from "./services/server/ai/observability/instrumentation.js";
 
 export {
+  ensureTelemetry,
   shutdownOpenTelemetry,
   flushOpenTelemetry,
   getLangfuseHealthStatus,

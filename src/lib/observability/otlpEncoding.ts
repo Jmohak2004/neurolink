@@ -35,8 +35,8 @@ function toOtlpValue(value: SpanAttributeValue): OtlpAnyValue {
     return { boolValue: value };
   }
   if (typeof value === "number") {
-    return Number.isInteger(value)
-      ? { intValue: String(value) }
+    return Number.isSafeInteger(value)
+      ? { intValue: value }
       : { doubleValue: value };
   }
   if (Array.isArray(value)) {

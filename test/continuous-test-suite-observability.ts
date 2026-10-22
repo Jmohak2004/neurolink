@@ -431,13 +431,20 @@ async function startLaya(): Promise<FakeUpstream> {
   };
 }
 
-type OtlpMode = "ok" | "partial" | "flaky" | "unauthorized";
+type OtlpMode =
+  | "ok"
+  | "partial"
+  | "flaky"
+  | "unauthorized"
+  | "recovering"
+  | "recovering-once";
 type OtlpHit = {
   path: string;
   authorization: string | undefined;
   headers: Record<string, string | string[] | undefined>;
   status: number;
   spans: DecodedSpan[];
+  payload: JsonBody;
 };
 type DecodedSpan = {
   traceId: string;
@@ -446,6 +453,9 @@ type DecodedSpan = {
   name: string;
   statusCode: number;
   attributes: JsonBody;
+};
+type RawResourceSpans = {
+  resource?: { attributes?: { key: string; value: JsonBody }[] };
 };
 
 function decodeValue(value: JsonBody): Json | undefined {
@@ -495,7 +505,8 @@ async function startLangfuse(mode: OtlpMode = "ok"): Promise<{
   const hits: OtlpHit[] = [];
   const sends = new Map<string, number>();
   const server = createServer(async (req, res) => {
-    const spans = decodeSpans(await readBody(req));
+    const payload = await readBody(req);
+    const spans = decodeSpans(payload);
     const answer = (status: number, body: Json): void => {
       hits.push({
         path: req.url ?? "",
@@ -503,11 +514,16 @@ async function startLangfuse(mode: OtlpMode = "ok"): Promise<{
         headers: req.headers,
         status,
         spans,
+        payload,
       });
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    if (mode === "unauthorized") {
+    if (
+      mode === "unauthorized" ||
+      (mode === "recovering" && hits.length < 2) ||
+      (mode === "recovering-once" && hits.length < 1)
+    ) {
       answer(401, { message: "Invalid credentials" });
       return;
     }
@@ -1761,6 +1777,98 @@ await test("an observability langfuse object enables the processor without env k
   assert(status.hasProcessor, "the config object did not enable the processor");
 });
 
+const BOOT = join(tempDir("neurolink-obs-boot-"), "boot.mjs");
+writeFileSync(
+  BOOT,
+  `
+import * as dist from ${JSON.stringify(
+    pathToFileURL(join(process.cwd(), "dist/index.js")).href,
+  )};
+const exported = typeof dist.ensureTelemetry === "function";
+if (exported) dist.ensureTelemetry(JSON.parse(process.env.OBS_CONFIG));
+const status = { exported, initialized: dist.isOpenTelemetryInitialized(), hasProcessor: dist.getLangfuseHealthStatus().hasProcessor };
+await dist.shutdownOpenTelemetry();
+console.log("STATUS " + JSON.stringify(status));
+process.exit(0);
+`,
+);
+
+async function runBoot(
+  config: JsonBody,
+  env: Record<string, string> = {},
+): Promise<{
+  status: { exported: boolean; initialized: boolean; hasProcessor: boolean };
+  output: string;
+}> {
+  const result = await runCommand(process.execPath, [BOOT], {
+    cwd: process.cwd(),
+    timeoutMs: 45_000,
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      DOTENV_CONFIG_PATH: "/dev/null",
+      NEUROLINK_SKIP_MCP: "true",
+      NEUROLINK_DEBUG: "true",
+      NEUROLINK_LOG_LEVEL: "warn",
+      OBS_CONFIG: JSON.stringify(config),
+      ...env,
+    },
+  });
+  assertEqual(result.exitCode, 0, "boot process failed");
+  return {
+    status: parseStatus(result.stdout),
+    output: `${result.stdout}\n${result.stderr}`,
+  };
+}
+
+await test("ensureTelemetry is exported and starts tracing from a configured base URL without warning about the default", async () => {
+  const { status, output } = await runBoot({
+    langfuse: {
+      publicKey: "pk-boot",
+      secretKey: "sk-boot",
+      baseUrl: "http://127.0.0.1:9",
+    },
+  });
+  assert(status.exported, "ensureTelemetry is not exported from the root");
+  assert(status.initialized, "ensureTelemetry did not start tracing");
+  assert(
+    status.hasProcessor,
+    "ensureTelemetry registered no Langfuse exporter",
+  );
+  assert(
+    !output.includes("https://cloud.langfuse.com"),
+    "a configured base URL still warned about the default",
+  );
+});
+
+await test("a Langfuse base URL left unset warns once that it falls back to cloud.langfuse.com", async () => {
+  const { status, output } = await runBoot({
+    langfuse: { publicKey: "pk-boot", secretKey: "sk-boot" },
+  });
+  assert(status.hasProcessor, "no Langfuse exporter was registered");
+  const warnings = output
+    .split("\n")
+    .filter((line) => line.includes("https://cloud.langfuse.com"));
+  assertEqual(warnings.length, 1, "default base URL warning count");
+  assert(
+    warnings[0].includes("observability.langfuse.baseUrl") &&
+      warnings[0].includes("LANGFUSE_BASE_URL"),
+    `the warning does not say how to set the URL: ${warnings[0]}`,
+  );
+});
+
+await test("an empty LANGFUSE_BASE_URL warns that it falls back to cloud.langfuse.com", async () => {
+  const { status, output } = await runBoot(
+    { langfuse: { publicKey: "pk-boot", secretKey: "sk-boot" } },
+    { LANGFUSE_BASE_URL: "" },
+  );
+  assert(status.hasProcessor, "no Langfuse exporter was registered");
+  const warnings = output
+    .split("\n")
+    .filter((line) => line.includes("https://cloud.langfuse.com"));
+  assertEqual(warnings.length, 1, "default base URL warning count");
+});
+
 section("trace delivery");
 
 const SCENARIO = join(tempDir("neurolink-obs-scenario-"), "scenario.mjs");
@@ -1808,10 +1916,19 @@ if (scenario === "outer") {
   await provider.generate({ input: { text: "hi" }, disableTools: true });
 } else if (scenario === "many") {
   for (let i = 0; i < 20; i++) await nl.generate(call("gpt-4o-mini"));
-} else if (scenario === "unauthorized") {
+} else if (scenario === "unauthorized" || scenario === "unauthorized-later" || scenario === "recovered") {
   await nl.generate(call("gpt-4o-mini"));
   await flushOpenTelemetry();
   await nl.generate(call("gpt-4o-mini"));
+  if (scenario !== "unauthorized") {
+    await flushOpenTelemetry();
+    if (scenario === "unauthorized-later") {
+      const now = Date.now;
+      Date.now = () => now() + 61_000;
+    }
+    await nl.generate(call("gpt-4o-mini"));
+  }
+  await nl.shutdown();
 } else {
   await nl.generate(call("gpt-4o-mini"));
 }
@@ -1824,6 +1941,7 @@ process.exit(0);
 async function runScenario(
   scenario: string,
   mode: OtlpMode = "ok",
+  env: Record<string, string> = {},
 ): Promise<{
   hits: OtlpHit[];
   spans: DecodedSpan[];
@@ -1847,6 +1965,7 @@ async function runScenario(
         OBS_SCENARIO: scenario,
         OBS_INGEST_URL: receiver.baseUrl,
         OBS_OPENAI_URL: fake.baseURL,
+        ...env,
       },
     });
     assertEqual(result.exitCode, 0, `scenario ${scenario} failed`);
@@ -2150,12 +2269,79 @@ await test("a 500 is retried and the batch is delivered", async () => {
   assert(byName(flaky.spans, "generate").length > 0, "nothing was delivered");
 });
 
-await test("a 401 is not retried and is logged once", async () => {
+await test("a 401 is not retried, is logged once inside the minute and the rest is logged at shutdown", async () => {
   const rejected = await runScenario("unauthorized", "unauthorized");
   assertEqual(rejected.hits.length, 2, "401 batches were retried");
-  const warnings =
-    rejected.output.split("Langfuse credentials rejected").length - 1;
-  assertEqual(warnings, 1, "credentials warning count");
+  const warnings = rejected.output
+    .split("\n")
+    .filter((line) => line.includes("Langfuse credentials rejected"));
+  assertEqual(warnings.length, 2, "credentials warning count");
+  const pending = rejected.hits[1].spans.length;
+  assert(
+    warnings[1].includes(`dropped ${pending} spans`),
+    `the shutdown line does not count ${pending} spans`,
+  );
+});
+
+await test("a 401 is logged without debug logging", async () => {
+  const rejected = await runScenario("unauthorized", "unauthorized", {
+    NEUROLINK_DEBUG: "false",
+  });
+  assert(
+    rejected.output.includes("Langfuse credentials rejected"),
+    "the credentials line was hidden without debug",
+  );
+});
+
+await test("a 401 keeps being logged once a minute with the spans dropped since", async () => {
+  const rejected = await runScenario("unauthorized-later", "unauthorized");
+  assertEqual(rejected.hits.length, 3, "401 batches were retried");
+  const warnings = rejected.output
+    .split("\n")
+    .filter((line) => line.includes("Langfuse credentials rejected"));
+  assertEqual(warnings.length, 2, "credentials warning count");
+  const first = rejected.hits[0].spans.length;
+  const later = rejected.hits[1].spans.length + rejected.hits[2].spans.length;
+  assert(
+    warnings[0].includes(`dropped ${first} spans`),
+    `first warning does not count ${first} spans`,
+  );
+  assert(
+    warnings[1].includes(`dropped ${later} spans`),
+    `second warning does not count ${later} spans`,
+  );
+  assert(
+    !rejected.output.includes("[langfuse] Dropped"),
+    "a refused batch also logged the per-batch drop warning",
+  );
+});
+
+await test("credentials accepted again inside the minute log the spans dropped since the last warning", async () => {
+  const recovered = await runScenario("recovered", "recovering");
+  assertEqual(recovered.hits.length, 3, "401 batches were retried");
+  assertEqual(recovered.hits[2].status, 200, "the third batch was refused");
+  const lines = recovered.output
+    .split("\n")
+    .filter((line) => line.includes("Langfuse credentials accepted again"));
+  assertEqual(lines.length, 1, "recovery line count");
+  const dropped = recovered.hits[1].spans.length;
+  assert(
+    lines[0].includes(`dropped ${dropped} spans since the last warning`),
+    `the recovery line does not count ${dropped} spans`,
+  );
+});
+
+await test("credentials accepted again after a single warned 401 still log the recovery", async () => {
+  const recovered = await runScenario("recovered", "recovering-once");
+  assertEqual(recovered.hits[0].status, 401, "the first batch was not refused");
+  const lines = recovered.output
+    .split("\n")
+    .filter((line) => line.includes("Langfuse credentials accepted again"));
+  assertEqual(lines.length, 1, "recovery line count");
+  assert(
+    lines[0].includes("dropped 0 spans since the last warning"),
+    "the recovery line counts spans the rejection warning already reported",
+  );
 });
 
 await test("shutdown delivers everything still queued", async () => {
@@ -2243,8 +2429,12 @@ import { NodeTracerProvider } from ${JSON.stringify(
 import { ROOT_CONTEXT, TraceFlags, context, trace } from ${JSON.stringify(
     import.meta.resolve("@opentelemetry/api"),
   )};
+import { resourceFromAttributes } from ${JSON.stringify(
+    import.meta.resolve("@opentelemetry/resources"),
+  )};
 const env = process.env;
-const host = new NodeTracerProvider({ spanProcessors: env.HOST_PROCESSOR === "1" ? [createExporterSpanProcessor()] : [] });
+const resource = env.HOST_RESOURCE === "1" ? { resource: resourceFromAttributes({ "process.pid": process.pid, "host.big.int": 2 ** 60 }) } : {};
+const host = new NodeTracerProvider({ ...resource, spanProcessors: env.HOST_PROCESSOR === "1" ? [createExporterSpanProcessor()] : [] });
 host.register();
 const langfuse = env.HOST_KEYS === "1" ? { publicKey: "pk-host", secretKey: "sk-host", baseUrl: env.OBS_INGEST_URL } : undefined;
 const make = () => new NeuroLink(langfuse ? { observability: { langfuse } } : undefined);
@@ -2272,6 +2462,7 @@ async function runHost(env: Record<string, string>): Promise<{
   status: { isHealthy: boolean; hasProcessor: boolean };
   spans: DecodedSpan[];
   sends: Map<string, number>;
+  bodies: JsonBody[];
 }> {
   const receiver = await startLangfuse();
   try {
@@ -2294,6 +2485,7 @@ async function runHost(env: Record<string, string>): Promise<{
       status: parseStatus(result.stdout),
       spans: receiver.hits.flatMap((entry) => entry.spans),
       sends: receiver.sends,
+      bodies: receiver.hits.map((entry) => entry.payload),
     };
   } finally {
     await receiver.close();
@@ -2375,6 +2567,41 @@ await test("a host provider without Langfuse configured registers no exporter, i
     LANGFUSE_SECRET_KEY: "sk-env",
   });
   assert(keyed.spans.length > 0, "keys in the environment exported nothing");
+});
+
+function resourceValues(bodies: JsonBody[], key: string): JsonBody[] {
+  return bodies
+    .flatMap((body) => (body.resourceSpans ?? []) as RawResourceSpans[])
+    .flatMap((group) => group.resource?.attributes ?? [])
+    .filter((entry) => entry.key === key)
+    .map((entry) => entry.value);
+}
+
+await test("host resource integers are JSON numbers: intValue when safe, doubleValue above MAX_SAFE_INTEGER", async () => {
+  const run = await runHost({
+    HOST_PROCESSOR: "1",
+    HOST_KEYS: "1",
+    HOST_RESOURCE: "1",
+  });
+  const pids = resourceValues(run.bodies, "process.pid");
+  assert(pids.length > 0, "no batch carried the host's process.pid");
+  for (const value of pids) {
+    assertEqual(
+      typeof value.intValue,
+      "number",
+      "process.pid intValue is not a JSON number",
+    );
+  }
+  const values = resourceValues(run.bodies, "host.big.int");
+  assert(values.length > 0, "no batch carried the large integer");
+  for (const value of values) {
+    assertEqual(
+      value.doubleValue,
+      2 ** 60,
+      "the large integer is not a doubleValue",
+    );
+    assert(!("intValue" in value), "the large integer kept an intValue");
+  }
 });
 
 await runSuite();

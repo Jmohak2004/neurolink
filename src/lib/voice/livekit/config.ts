@@ -86,8 +86,9 @@ export function resolveBrainDefaults(): LiveKitBrainDefaults {
 }
 
 const DEFAULT_REALTIME_MODEL = "gemini-live-2.5-flash";
-// xAI's documented flagship Grok Voice id. Never exercised against the real
-// service; the plugin's own default is `grok-voice-think-fast-1.0`.
+// xAI's documented flagship Grok Voice id, accepted and honoured by the live
+// service (2026-10-20). The plugin's own default, `grok-voice-think-fast-1.0`,
+// ran as `grok-voice-3.0` there.
 const DEFAULT_XAI_REALTIME_MODEL = "grok-voice-3.0";
 const DEFAULT_REALTIME_LOCATION = "global";
 const DEFAULT_RESPONSE_MODALITY = "AUDIO";
@@ -162,7 +163,7 @@ function isLoopbackHost(hostname: string): boolean {
  * check. The error names the setting and the opt-in and does not repeat the
  * value.
  */
-export function requireNoCleartextCrossHost(value: string, name: string): void {
+function requireNoCleartextCrossHost(value: string, name: string): void {
   const url = parseWebSocketUrl(value);
   if (
     url?.protocol === "ws:" &&
@@ -175,8 +176,13 @@ export function requireNoCleartextCrossHost(value: string, name: string): void {
   }
 }
 
-/** A ws or wss URL that passes `requireNoCleartextCrossHost`. The error names the setting and does not repeat the value. */
-function requireWebSocketUrl(value: string, name: string): string {
+/**
+ * A ws or wss URL that passes `requireNoCleartextCrossHost`. The error names the
+ * setting and does not repeat the value. Exported so the model factory applies
+ * the same check to a hand-built config as config resolution applies to the
+ * variable and to a caller's override.
+ */
+export function requireWebSocketUrl(value: string, name: string): string {
   if (parseWebSocketUrl(value) === undefined) {
     throw new Error(`${name} must be a ws:// or wss:// URL`);
   }

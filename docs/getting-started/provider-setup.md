@@ -112,7 +112,7 @@ Embedding, media-generation, and decision-only providers — not part of `genera
 - **[Replicate](providers/replicate.md)**, **[Stability AI](providers/stability.md)**, **[Ideogram](providers/ideogram.md)**, **[Recraft](providers/recraft.md)** - direct image generation
 - **[TypeSafe Jev](providers/typesafe.md)** - decision-only; serves `decide()`, not `generate()`/`stream()`. Set `TYPESAFE_API_KEY` (or `AI_GATEWAY_API_KEY` for the gateway transport)
 - **[Laya](providers/laya.md)** - decision-only, open-weights; serves `decide()` on a Laya server or LiteLLM proxy route you configure. Set `LAYA_API_KEY` + `LAYA_BASE_URL`; used when TypeSafe isn't configured
-- **[XOR](providers/xor.md)** - decision-only, open-weights XOR (`xor-latest` for text, `xor-omni` for images or video); serves `decide()`. Set `XOR_API_KEY` + `XOR_BASE_URL` (`XOR_MODEL` is optional, default `xor-latest`); used when neither TypeSafe nor Laya is configured
+- **[XOR](providers/xor.md)** - decision-only, open-weights XOR (`xor-latest` for text, `xor-omni` for an image, audio or `value` questions); serves `decide()`. Set `XOR_API_KEY` + `XOR_BASE_URL` (`XOR_MODEL` is optional, default `xor-latest`); used when neither TypeSafe nor Laya is configured
 - **[SubQ](providers/subq.md)** - decision-only; serves `decide()` with `subq-snap-preview` (public preview) at `https://api.subq.ai`. Set `SUBQ_API_KEY` alone (`SUBQ_MODEL` and `SUBQ_BASE_URL` are optional); the key comes from console.subq.ai and is shown once. NeuroLink does not send it images or video; used when none of TypeSafe, Laya or XOR is configured, ahead of Perplexity and Cloudflare Clef (its key is shared with no other provider)
 - **[Perplexity Decisions](providers/perplexity-decider.md)** - decision-only; serves `decide()` with `pplx-decider-v1-27b` and takes images (no video). Set `PERPLEXITY_API_KEY` alone (`PERPLEXITY_DECIDER_MODEL` and `PERPLEXITY_DECIDER_BASE_URL` are optional); used when none of TypeSafe, Laya, XOR or SubQ is configured. The key is shared with the Perplexity text provider, so a key set for Sonar also configures it
 - **[Cloudflare Clef](providers/cloudflare-clef.md)** - decision-only; serves `decide()` with `clef` (27B, the default) or `clef-flash` (9B) and takes up to 4 images (no video). Set `CLOUDFLARE_API_KEY` (Workers AI permission) **and** `CLOUDFLARE_ACCOUNT_ID`, both required (`CLOUDFLARE_CLEF_MODEL` and `CLOUDFLARE_CLEF_BASE_URL` are optional); used when none of TypeSafe, Laya, XOR, SubQ or Perplexity is configured (OpenAI Decisions and ScaleDown come after it). The two variables are shared with the Cloudflare Workers AI text provider, so a token and account id set for it also configure Clef. The Workers AI state window changed in October 2026 (about 2,048 tokens until 2026-10-04, far more on 2026-10-07; hosted service or model: unknown), and NeuroLink refuses a state it estimates over 16,000 tokens
@@ -1528,7 +1528,7 @@ export NVIDIA_NIM_API_KEY="nvapi-your-nvidia-api-key"
 ### Optional Configuration
 
 ```bash
-export NVIDIA_NIM_MODEL="meta/llama-3.3-70b-instruct"              # Default model
+export NVIDIA_NIM_MODEL="openai/gpt-oss-20b"                         # Default model
 export NVIDIA_NIM_BASE_URL="https://integrate.api.nvidia.com/v1"   # Default; override for self-hosted NIM
 ```
 
@@ -1546,7 +1546,7 @@ export NVIDIA_NIM_CHAT_TEMPLATE=""          # Override model chat template (adva
 
 ### Supported Models
 
-- `meta/llama-3.3-70b-instruct` (default) - Meta Llama 3.3 70B Instruct
+- `openai/gpt-oss-20b` (default) - OpenAI gpt-oss 20B, 128K context, tool calling
 - Any model from the [NVIDIA NIM catalog](https://build.nvidia.com/models)
 
 ### Usage Example
@@ -1559,7 +1559,7 @@ const neurolink = new NeuroLink();
 const result = await neurolink.generate({
   input: { text: "Explain GPU architecture" },
   provider: "nvidia-nim",
-  model: "meta/llama-3.3-70b-instruct",
+  model: "openai/gpt-oss-20b",
   temperature: 0.7,
   maxTokens: 1000,
 });
@@ -1596,7 +1596,7 @@ export NVIDIA_NIM_BASE_URL="http://your-nim-server:8000/v1"
 | Variable                        | Required | Default                               | Description                             |
 | ------------------------------- | -------- | ------------------------------------- | --------------------------------------- |
 | `NVIDIA_NIM_API_KEY`            | ✅       | -                                     | NVIDIA NIM API key (Bearer token)       |
-| `NVIDIA_NIM_MODEL`              | ❌       | `meta/llama-3.3-70b-instruct`         | Default model                           |
+| `NVIDIA_NIM_MODEL`              | ❌       | `openai/gpt-oss-20b`                  | Default model                           |
 | `NVIDIA_NIM_BASE_URL`           | ❌       | `https://integrate.api.nvidia.com/v1` | Override for self-hosted NIM            |
 | `NVIDIA_NIM_TOP_K`              | ❌       | -                                     | Top-K sampling parameter                |
 | `NVIDIA_NIM_MIN_P`              | ❌       | -                                     | Min-P sampling parameter                |
@@ -1925,7 +1925,7 @@ DEEPSEEK_MODEL=deepseek-chat  # Optional (deepseek-chat or deepseek-reasoner)
 
 # NVIDIA NIM
 NVIDIA_NIM_API_KEY=nvapi-your-nvidia-key
-NVIDIA_NIM_MODEL=meta/llama-3.3-70b-instruct  # Optional
+NVIDIA_NIM_MODEL=openai/gpt-oss-20b  # Optional
 
 # LM Studio (local — no API key required)
 LM_STUDIO_BASE_URL=http://localhost:1234/v1  # Optional

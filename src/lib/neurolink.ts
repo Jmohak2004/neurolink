@@ -99,6 +99,7 @@ import type {
   SpanData,
   ConfirmationResponseEvent,
   HITLConfig,
+  ExporterStatus,
   ObservabilityConfig,
   TaskManagerConfig,
   WorkflowConfig,
@@ -246,7 +247,10 @@ import {
   snapshotDecisionQuestion,
   stripHostAnswers,
 } from "./utils/decisionAnswers.js";
-import { resolveDecisionLimitsReading } from "./utils/decisionLimits.js";
+import {
+  resolveDecisionLimitsReading,
+  unsupportedDecisionQuestion,
+} from "./utils/decisionLimits.js";
 import type { RedisConversationMemoryManager } from "./core/redisConversationMemoryManager.js";
 import {
   isDirectTTSRequest,
@@ -257,7 +261,7 @@ import { ProviderFactory } from "./factories/providerFactory.js";
 import { ProviderRegistry } from "./factories/providerRegistry.js";
 import { FileReferenceRegistry } from "./files/fileReferenceRegistry.js";
 import { createFileTools } from "./files/fileTools.js";
-import { HITLManager } from "./hitl/hitlManager.js";
+import { HITLManager, DEFAULT_ALLOW_MODIFICATION } from "./hitl/hitlManager.js";
 import { ToolCallBatcher } from "./mcp/batching/index.js";
 // MCP Enhancement modules - wired into core execution path
 import { ToolResultCache } from "./mcp/caching/index.js";
@@ -331,10 +335,12 @@ import type {
   TerminalAgentModeVersion,
 } from "./types/index.js";
 import { resolveTerminalAgentMode } from "./agent/prompts/terminalAgentPrompt.js";
+import { getExporterRegistry } from "./observability/exporterRegistry.js";
 import { SpanSerializer } from "./observability/utils/spanSerializer.js";
-import { withSpan } from "./telemetry/withSpan.js";
+import { endSpanWhenDropped, withSpan } from "./telemetry/withSpan.js";
 import { getActiveTraceContext } from "./telemetry/traceContext.js";
 import { calculateCost } from "./utils/pricing.js";
+import { createToolExecutionId } from "./utils/toolExecutionId.js";
 import {
   acquireTelemetry,
   ensureTelemetry,
@@ -651,7 +657,10 @@ const MEMORY_WRITE_TIMEOUT_MS = 30_000;
  *
  * @example With HITL security
  * ```typescript
- * import type { ConfirmationRequestEvent } from '@juspay/neurolink';
+ * import type {
+ *   ConfirmationRequestEvent,
+ *   ConfirmationResponseEvent,
+ * } from '@juspay/neurolink';
  *
  * const neurolink = new NeuroLink({
  *   hitl: {
@@ -664,12 +673,20 @@ const MEMORY_WRITE_TIMEOUT_MS = 30_000;
  * // Approval is event-based; answer each request with the matching id
  * const emitter = neurolink.getEventEmitter();
  * emitter.on('hitl:confirmation-request', async (event) => {
+ *   const receivedAt = Date.now();
  *   const { payload } = event as ConfirmationRequestEvent; // listeners are typed unknown
  *   const approved = await askUser(payload); // your approval UI
  *   emitter.emit('hitl:confirmation-response', {
  *     type: 'hitl:confirmation-response',
- *     payload: { confirmationId: payload.confirmationId, approved }
- *   });
+ *     payload: {
+ *       confirmationId: payload.confirmationId,
+ *       approved,
+ *       metadata: {
+ *         timestamp: new Date().toISOString(),
+ *         responseTime: Date.now() - receivedAt // ms since the request arrived
+ *       }
+ *     }
+ *   } satisfies ConfirmationResponseEvent);
  * });
  * ```
  *
@@ -831,6 +848,9 @@ function startTurn(
   span: Span,
   optionsOrPrompt: GenerateOptions | StreamOptions | DynamicOptions | string,
 ): void {
+  if (!span.isRecording()) {
+    return;
+  }
   observeTurn(span, { input: turnInput(optionsOrPrompt) });
   if (typeof optionsOrPrompt !== "string") {
     const name = (optionsOrPrompt as GenerateOptions).context?.observationName;
@@ -903,71 +923,97 @@ function traceTurnStream<T>(
       );
     }
   };
+  const advance = async (
+    pull: () => Promise<IteratorResult<T>>,
+    afterThrow = false,
+  ): Promise<IteratorResult<T>> => {
+    started = true;
+    try {
+      const step = await context.with(turnContext, pull);
+      if (step.done) {
+        span.setStatus({ code: SpanStatusCode.OK });
+        end(observationLevel(result.finishReason));
+        return { done: true, value: undefined };
+      }
+      const content =
+        typeof step.value === "object" && step.value !== null
+          ? (step.value as { content?: string }).content
+          : undefined;
+      if (typeof content === "string") {
+        output += content;
+      }
+      return step;
+    } catch (error) {
+      failTurnSpan(
+        span,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      // A consumer that throws into the stream ends it early, as return()
+      // does, and the root has always kept the model in that case.
+      if (afterThrow) {
+        observeTurn(span, { metadata: { model: result.model } });
+      }
+      finish();
+      throw error;
+    }
+  };
   const traced: AsyncIterableIterator<T> = {
     async next(): Promise<IteratorResult<T>> {
       if (ended) {
         return { done: true, value: undefined };
       }
-      started = true;
-      try {
-        const step = await context.with(turnContext, () => iterator.next());
-        if (step.done) {
-          span.setStatus({ code: SpanStatusCode.OK });
-          end(observationLevel(result.finishReason));
-          return { done: true, value: undefined };
-        }
-        const content =
-          typeof step.value === "object" && step.value !== null
-            ? (step.value as { content?: string }).content
-            : undefined;
-        if (typeof content === "string") {
-          output += content;
-        }
-        return step;
-      } catch (error) {
-        failTurnSpan(
-          span,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-        finish();
-        throw error;
-      }
+      return advance(() => iterator.next());
     },
     async return(): Promise<IteratorResult<T>> {
       await close();
       return { done: true, value: undefined };
     },
     async throw(error: Error): Promise<IteratorResult<T>> {
-      await close();
-      throw error;
+      const forward = iterator.throw;
+      if (ended || forward === undefined) {
+        await close();
+        throw error;
+      }
+      return advance(() => forward.call(iterator, error), true);
     },
     [Symbol.asyncIterator]() {
       return traced;
     },
   };
+  endSpanWhenDropped(traced, span);
   return traced;
 }
 
+/**
+ * Runs every pull of `stream` inside `drainContext`, and forwards `return()`
+ * and `throw()` to it even before the first `next()`. A generator that has not
+ * started never enters its body, so wrapping the drain in one would swallow a
+ * pre-start close and leave the drain's own settle step unreached.
+ */
 function drainInContext<T>(
   stream: AsyncIterable<T>,
   drainContext: Context,
-): AsyncGenerator<T> {
-  return (async function* () {
-    const iterator = stream[Symbol.asyncIterator]();
-    try {
-      while (true) {
-        const step = await context.with(drainContext, () => iterator.next());
-        if (step.done) {
-          return;
-        }
-        yield step.value;
+): AsyncIterableIterator<T> {
+  const iterator = stream[Symbol.asyncIterator]();
+  const drained: AsyncIterableIterator<T> = {
+    next: () => context.with(drainContext, () => iterator.next()),
+    async return(): Promise<IteratorResult<T>> {
+      await context.with(drainContext, async () => iterator.return?.());
+      return { done: true, value: undefined };
+    },
+    async throw(error: Error): Promise<IteratorResult<T>> {
+      const forward = iterator.throw;
+      if (forward === undefined) {
+        await context.with(drainContext, async () => iterator.return?.());
+        throw error;
       }
-    } finally {
-      await context.with(drainContext, async () => {
-        await iterator.return?.();
-      });
-    }
-  })();
+      return context.with(drainContext, () => forward.call(iterator, error));
+    },
+    [Symbol.asyncIterator]() {
+      return drained;
+    },
+  };
+  return drained;
 }
 
 /** Monotonic source for {@link NeuroLink.logInstanceId}. Process-local by design. */
@@ -1362,8 +1408,8 @@ export class NeuroLink {
     traceId: string;
     parentSpanId: string;
   } {
-    // Attempt to reuse the active OTel trace context so Pipeline B spans
-    // land in the same Langfuse trace as Pipeline A spans.
+    // Reuse the active OTel trace context so the in-process span records
+    // carry the traceId of the exported OTEL trace of the same request.
     const activeSpan = trace.getSpan(context.active());
     if (activeSpan) {
       const spanCtx = activeSpan.spanContext();
@@ -2267,7 +2313,7 @@ export class NeuroLink {
           dangerousActions: config.hitl.dangerousActions || [],
           timeout: config.hitl.timeout || 30000,
           allowArgumentModification:
-            config.hitl.allowArgumentModification ?? true,
+            config.hitl.allowArgumentModification ?? DEFAULT_ALLOW_MODIFICATION,
           auditLogging: config.hitl.auditLogging ?? false,
         },
         message: "Starting HITL (Human-in-the-Loop) initialization",
@@ -2308,7 +2354,7 @@ export class NeuroLink {
           dangerousActions: config.hitl.dangerousActions?.length || 0,
           timeout: config.hitl.timeout || 30000,
           allowArgumentModification:
-            config.hitl.allowArgumentModification ?? true,
+            config.hitl.allowArgumentModification ?? DEFAULT_ALLOW_MODIFICATION,
           auditLogging: config.hitl.auditLogging ?? false,
         });
       } catch (error) {
@@ -4367,6 +4413,10 @@ Current user's request: ${currentInput}`;
 
   /**
    * Get comprehensive telemetry status including Langfuse and OpenTelemetry state
+   * and every registered exporter with its queued, delivered and dropped spans.
+   * `openTelemetry.enabled` is whether tracing is initialized, as it always
+   * was. Beside a host TracerProvider, `openTelemetry.usingExternalProvider`
+   * is `true`: NeuroLink exports nothing to the endpoint.
    */
   getTelemetryStatus(): {
     enabled: boolean;
@@ -4379,12 +4429,14 @@ Current user's request: ${currentInput}`;
       enabled: boolean;
       endpoint?: string;
       serviceName?: string;
+      usingExternalProvider?: boolean;
     };
+    exporters: ExporterStatus[];
   } {
     const langfuseConfig = this.observabilityConfig?.langfuse;
     const langfuseOptions =
       typeof langfuseConfig === "object" ? langfuseConfig : undefined;
-    const { hasProcessor } = getLangfuseHealthStatus();
+    const { hasProcessor, usingExternalProvider } = getLangfuseHealthStatus();
 
     return {
       enabled: isOpenTelemetryInitialized(),
@@ -4393,7 +4445,9 @@ Current user's request: ${currentInput}`;
           ? {
               enabled: hasProcessor,
               baseUrl:
-                langfuseOptions?.baseUrl ?? process.env.LANGFUSE_BASE_URL,
+                langfuseOptions?.baseUrl ||
+                process.env.LANGFUSE_BASE_URL ||
+                undefined,
               environment:
                 langfuseOptions?.environment ??
                 process.env.LANGFUSE_TRACING_ENVIRONMENT,
@@ -4405,8 +4459,10 @@ Current user's request: ${currentInput}`;
               enabled: isOpenTelemetryInitialized(),
               endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
               serviceName: process.env.OTEL_SERVICE_NAME,
+              ...(usingExternalProvider && { usingExternalProvider }),
             }
           : undefined,
+      exporters: getExporterRegistry().getStatuses(),
     };
   }
 
@@ -10153,8 +10209,12 @@ Current user's request: ${currentInput}`;
         return { done: true, value: undefined };
       },
       async throw(error: Error): Promise<IteratorResult<T>> {
-        await scope.run(eventScope, async () => iterator.return?.());
-        throw error;
+        const forward = iterator.throw;
+        if (forward === undefined) {
+          await scope.run(eventScope, async () => iterator.return?.());
+          throw error;
+        }
+        return scope.run(eventScope, () => forward.call(iterator, error));
       },
       [Symbol.asyncIterator]() {
         return bound;
@@ -10615,6 +10675,7 @@ Current user's request: ${currentInput}`;
             },
           });
           attempt.stream = drainInContext(attempt.stream, context.active());
+          endSpanWhenDropped(attempt.stream, streamSpan);
           return attempt;
         }),
       );
@@ -11650,7 +11711,19 @@ Current user's request: ${currentInput}`;
         }
         return stream.return(value);
       },
-      throw: (error) => stream.throw(error),
+      throw: async (error) => {
+        if (!started) {
+          started = true;
+          await this.settleStandardStreamDrain(drain, {
+            accumulatedContent: "",
+            chunkCount: 0,
+            streamError:
+              error instanceof Error ? error : new Error(String(error)),
+            resolvedUsage: undefined,
+          });
+        }
+        return stream.throw(error);
+      },
       [Symbol.asyncIterator]: () => guarded,
     };
     return guarded;
@@ -12116,9 +12189,6 @@ Current user's request: ${currentInput}`;
       hrTimeStart,
     );
 
-    // Initialize MCP
-    await this.initializeMCP();
-
     // Memory retrieval
     if (
       this.shouldReadMemory(options.memory, options.context?.userId) &&
@@ -12180,6 +12250,16 @@ Current user's request: ${currentInput}`;
 
     // Auto-disable tools for Ollama models that don't support them
     await this.autoDisableOllamaStreamTools(options);
+
+    // generate() skips MCP when tools are disabled, so stream() must too:
+    // initialization loads the working directory's .mcp-config.json and waits
+    // for every stdio server it names before the request is sent, so an
+    // `npx -y …` entry on a slow npm registry stalls a stream that never
+    // needed a tool. Decided after the Ollama check above, which can turn
+    // tools off. Providers register themselves in AIProviderFactory.
+    if (!options.disableTools) {
+      await this.initializeMCP();
+    }
 
     // RAG Integration: If rag config is provided, prepare the RAG search tool
     if (options.rag?.files?.length) {
@@ -14214,7 +14294,7 @@ Current user's request: ${currentInput}`;
     input: unknown,
     startTime: number = Date.now(),
   ): string {
-    const executionId = `${toolName}-${startTime}-${Math.random().toString(36).substr(2, 9)}`;
+    const executionId = createToolExecutionId(toolName, startTime);
 
     // Create execution context for tracking
     const context: ToolExecutionContext = {
@@ -19146,12 +19226,14 @@ Current user's request: ${currentInput}`;
    *    many would have the WHOLE request refused, and NeuroLink's own routing
    *    would silently degrade to the heuristic — the host's problem would
    *    become NeuroLink's. A provider that declares no `maxQuestions`
-   *    (TypeSafe, XOR) takes every well-formed addition.
+   *    (TypeSafe) takes every well-formed addition. For the same reason a
+   *    question the provider cannot answer (a type it does not list, a choice
+   *    or score past its cap) is dropped on its own.
    * 4. Answers are split: the consumer sees only its own ids, exactly as it
    *    would without hooks; `onAnswers` gets the host's answers under the
    *    host's original ids plus the full result.
    *
-   * The request's `images` and `video` ride along untouched — `merged` and
+   * The request's `images`, `video` and `audio` ride along untouched — `merged` and
    * the wire call spread the request, and only `state`, the questions and
    * the result are cloned — so an XOR request keeps its Buffers and its
    * result keeps `mediaBytes`.
@@ -19164,13 +19246,15 @@ Current user's request: ${currentInput}`;
    * on the wire can differ from the instance's.
    *
    * Fail-open by construction, in three layers. Without a decision provider
-   * nothing runs at all — no hook, no event — and the consumer gets the null
-   * it always got. Everything a host can reach (its hook's return value, the
-   * event payloads, the answer split, `onAnswers`) runs inside one `try`;
-   * whatever a host throws, the consumer gets what `tryRunDecide` alone
-   * would have given it. And every host-facing value is a `structuredClone`,
-   * so a hook or listener that edits what it is handed edits neither the
-   * wire request nor the consumer's own question objects.
+   * no hook runs and no event is emitted: the call goes to `tryRunDecide`
+   * alone, which records the WARNING `decide` observation it always did, and
+   * the consumer gets the null it always got. Everything a host can reach
+   * (its hook's return value, the event payloads, the answer split,
+   * `onAnswers`) runs inside one `try`; whatever a host throws, the consumer
+   * gets what `tryRunDecide` alone would have given it. And every
+   * host-facing value is a `structuredClone`, so a hook or listener that
+   * edits what it is handed edits neither the wire request nor the
+   * consumer's own question objects.
    *
    * `outer` is what the surrounding `generate()` / `stream()` supplies —
    * per-call credentials, abort signal, ids — and wins over the same fields
@@ -19196,9 +19280,10 @@ Current user's request: ${currentInput}`;
     if (!site) {
       return this.tryRunDecide(merged);
     }
-    // Inert without a decision provider: a host's hook must not sit on the
-    // request path of a tenant that has no decision model to reach, and an
-    // event for a call that could never be made would only mislead.
+    // No host hook or event without a decision provider: a hook must not sit
+    // on the request path of a tenant that has no decision model to reach, and
+    // an event for a call that could never be made would only mislead. The
+    // plain call still runs, so the WARNING observation it records is kept.
     if (
       !this.resolveDecisionProviderName(merged.provider, merged.credentials)
     ) {
@@ -19265,7 +19350,7 @@ Current user's request: ${currentInput}`;
             model: merged.model,
             credentials: merged.credentials,
           });
-          // A provider without a question-count cap (TypeSafe, XOR) takes
+          // A provider without a question-count cap (TypeSafe) takes
           // every well-formed addition; its token/byte limits still apply
           // and are what `decisionLimits()` reports for sizing.
           const room =
@@ -19276,6 +19361,7 @@ Current user's request: ${currentInput}`;
             ...ownQuestions,
           };
           let invalidCount = 0;
+          let unsupportedCount = 0;
           let overflowCount = 0;
           for (const [hostId, proposal] of proposedEntries) {
             // The wire carries a snapshot of the host's question, never the
@@ -19283,6 +19369,12 @@ Current user's request: ${currentInput}`;
             const question = snapshotDecisionQuestion(proposal);
             if (question === undefined) {
               invalidCount += 1;
+              continue;
+            }
+            // A question the provider cannot read would have the whole
+            // request refused, NeuroLink's own questions with it.
+            if (unsupportedDecisionQuestion(question, limits) !== undefined) {
+              unsupportedCount += 1;
               continue;
             }
             if (hostIdByWireId.size >= room) {
@@ -19299,6 +19391,11 @@ Current user's request: ${currentInput}`;
           if (invalidCount > 0) {
             logger.warn(
               `[Decision] dropped ${invalidCount} malformed host question(s) for site "${site}"`,
+            );
+          }
+          if (unsupportedCount > 0) {
+            logger.warn(
+              `[Decision] dropped ${unsupportedCount} host question(s) for site "${site}" that ${limits?.provider ?? "the decision provider"} cannot answer`,
             );
           }
           if (overflowCount > 0 && limits) {
@@ -19460,6 +19557,7 @@ Current user's request: ${currentInput}`;
           "ai.provider": providerName,
           "decision.question_count": questionCount,
           "decision.images.count": options.images?.length ?? 0,
+          "decision.audio.count": options.audio === undefined ? 0 : 1,
           ...siteSpanAttributes,
         },
       },
@@ -19493,6 +19591,7 @@ Current user's request: ${currentInput}`;
             "ai.model": options.model ?? "",
             "decision.question_count": questionCount,
             "decision.images.count": options.images?.length ?? 0,
+            "decision.audio.count": options.audio === undefined ? 0 : 1,
             ...siteSpanAttributes,
           },
           parentSpanId,
@@ -19521,6 +19620,7 @@ Current user's request: ${currentInput}`;
             questions: options.questions,
             images: options.images,
             video: options.video,
+            audio: options.audio,
             model: options.model,
             signal: options.signal,
             timeoutMs: options.timeoutMs,
@@ -19587,11 +19687,14 @@ Current user's request: ${currentInput}`;
               ? { "decision.upstream_ms": result.upstreamMs }
               : {}),
           });
-          // BOTH aggregators, exactly as the generate path does. The
-          // instance one is what `neurolink.getMetrics()` / `getSpans()`
-          // read; the global one is what the exporters drain. Recording to
-          // only the global one would make a decision invisible to the very
-          // API a caller would use to check whether it ran.
+          // BOTH aggregators, exactly as the generate path does. They are
+          // in-process stores that are never exported: what Langfuse and the
+          // OTLP exporters receive for this decision is the `decide`
+          // generation span. The instance one is what
+          // `neurolink.getMetrics()` / `getSpans()` read; the global one is
+          // what `getMetricsAggregator()` readers see. Recording to only the
+          // global one would make a decision invisible to the very API a
+          // caller would use to check whether it ran.
           const ended = SpanSerializer.endSpan(span, SpanStatus.OK);
           this.metricsAggregator.recordSpan(ended);
           getMetricsAggregator().recordSpan(ended);
@@ -19856,6 +19959,37 @@ Current user's request: ${currentInput}`;
             o.onPartial(text);
           }
           return text;
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      render: async (o) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), o.timeoutMs);
+        // Output rendering is translation, often worth a stronger model than
+        // the rewrite; it has its own setting and falls back to the rewrite's.
+        const provider =
+          o.provider ??
+          (process.env.NEUROLINK_STT_OUTPUT_PROVIDER?.trim() ||
+            process.env.NEUROLINK_STT_REWRITE_PROVIDER?.trim());
+        const model =
+          o.model ??
+          (process.env.NEUROLINK_STT_OUTPUT_MODEL?.trim() ||
+            process.env.NEUROLINK_STT_REWRITE_MODEL?.trim());
+        try {
+          const generated = await this.generate({
+            input: { text: o.user },
+            systemPrompt: o.system,
+            schema: o.schema,
+            ...(provider ? { provider } : {}),
+            ...(model ? { model } : {}),
+            maxTokens: o.maxTokens,
+            temperature: 0,
+            disableTools: true,
+            memory: { enabled: false },
+            abortSignal: controller.signal,
+          });
+          return generated.structuredData ?? generated.content ?? "";
         } finally {
           clearTimeout(timer);
         }

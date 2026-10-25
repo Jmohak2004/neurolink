@@ -23,13 +23,14 @@ import type {
   ServerContext,
   HonoRateLimitEntry,
 } from "../../types/index.js";
+import { markContextCarried } from "../utils/carriedContextMark.js";
 import { isErrorResponse } from "../utils/validation.js";
 import {
   isRawBodyContentType,
   isWebResponse,
   parseByteLimit,
   RawBodyTooLargeError,
-  readRawBody,
+  readBoundedRequestBody,
 } from "../utils/rawBody.js";
 
 // Declare global for runtime detection
@@ -43,41 +44,28 @@ declare const Deno:
  * Supports multiple runtimes: Bun, Deno, Node.js
  */
 
-/** Raw bodies already read for a request, so a second extraction never hits a consumed stream. */
-const rawBodies = new WeakMap<Request, Buffer | RawBodyTooLargeError>();
-
-/** A web `ReadableStream` of bytes as an async iterable of Buffers, releasing the reader on exit. */
-async function* webStreamChunks(
-  stream: ReadableStream<Uint8Array>,
-): AsyncIterable<Buffer> {
-  const reader = stream.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) {
-        return;
-      }
-      if (value) {
-        yield Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
-
 export class HonoServerAdapter extends BaseServerAdapter {
   private app!: Hono;
   private server?: unknown;
   private rateLimitStore = new Map<string, HonoRateLimitEntry>();
   private rateLimitCleanupInterval?: ReturnType<typeof setInterval>;
-  // Store context by request ID for sharing between middleware and route handlers
-  private requestContextStore = new Map<string, ServerContext>();
+  // Context shared between middleware and the route handler. Keyed by the request
+  // object, never by the request id: the id can be the
+  // caller's own X-Request-ID, so two overlapping requests that send the same one
+  // would share a context, and the second would run with the first one's
+  // identity, headers and body. A WeakMap also frees an entry whose handler
+  // never ran.
+  private requestContextStore = new WeakMap<Request, ServerContext>();
+  // One id per request, for logs and events: the caller's X-Request-ID when sent,
+  // otherwise generated once, so every step reports the same id. With no header
+  // every step used to invent its own.
+  private requestIds = new WeakMap<Request, string>();
   // Populated by initializeFramework's dynamic imports; used by methods that
   // run after initialization (route registration, streaming) and so cannot
   // rely on initializeFramework's own local closure variables.
   private HTTPExceptionCtor!: typeof import("hono/http-exception").HTTPException;
   private streamSSEFn!: typeof import("hono/streaming").streamSSE;
+  private parseFormBody!: typeof import("hono/utils/body").parseBody;
 
   constructor(neurolink: NeuroLink, config: ServerAdapterConfig = {}) {
     super(neurolink, config);
@@ -109,7 +97,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
           headers[name] = value;
         });
         const minCtx = {
-          requestId: c.req.header("X-Request-ID") || this.generateRequestId(),
+          requestId: this.requestIdFor(c),
           method: c.req.method,
           path: c.req.path,
           headers,
@@ -196,6 +184,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
       { secureHeaders },
       { streamSSE },
       { timeout },
+      { parseBody },
     ] = await Promise.all([
       this.importFrameworkDependency<typeof import("hono")>("hono", "hono"),
       this.importFrameworkDependency<typeof import("hono/cors")>(
@@ -222,10 +211,15 @@ export class HonoServerAdapter extends BaseServerAdapter {
         "hono/timeout",
         "hono",
       ),
+      this.importFrameworkDependency<typeof import("hono/utils/body")>(
+        "hono/utils/body",
+        "hono",
+      ),
     ]);
 
     this.HTTPExceptionCtor = HTTPException;
     this.streamSSEFn = streamSSE;
+    this.parseFormBody = parseBody;
 
     this.app = new Hono();
 
@@ -272,8 +266,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
 
     // Global error handler
     this.app.onError((error, c) => {
-      const requestId =
-        c.req.header("X-Request-ID") || this.generateRequestId();
+      const requestId = this.requestIdFor(c);
 
       this.logRequestError("HonoAdapter", requestId, error);
 
@@ -354,9 +347,11 @@ export class HonoServerAdapter extends BaseServerAdapter {
       | "options";
 
     this.app[method](route.path, async (c: HonoContext) => {
-      const requestId =
-        c.req.header("X-Request-ID") || this.generateRequestId();
-      const connectionId = `conn-${requestId}`;
+      const requestId = this.requestIdFor(c);
+      // Not derived from the request id, which a caller may repeat: two
+      // overlapping requests would then share one record and the first to
+      // finish would untrack the other.
+      const connectionId = `conn-${this.generateRequestId()}`;
       const startTime = Date.now();
 
       // Track connection for graceful shutdown
@@ -367,18 +362,30 @@ export class HonoServerAdapter extends BaseServerAdapter {
         const params = c.req.param() as Record<string, string>;
 
         // Reuse existing context from middleware if available, otherwise create new one
-        const existingCtx = this.requestContextStore.get(requestId);
-        const ctx =
-          existingCtx ||
-          this.createContext({
-            requestId,
-            method: c.req.method,
-            path: c.req.path,
-            headers: this.extractHeaders(c),
-            query: this.extractQuery(c),
-            params,
-            body: await this.extractBody(c),
-          });
+        const existingCtx = this.requestContextStore.get(c.req.raw);
+        // Middleware ran before the router matched this route, so the shared
+        // context carries no path parameters yet.
+        if (existingCtx) {
+          existingCtx.params = params;
+          // The one request the handler already got the middleware's context
+          // for before this adapter carried it on every request: the caller
+          // sent its own X-Request-ID, which the old store was keyed by. That
+          // context stays unmarked, so the agent routes keep trusting its
+          // ctx.user there. A context found for any other request exists only
+          // because the server carries middleware state, is new to the
+          // handler, and is marked.
+          if (!c.req.header("X-Request-ID")) {
+            markContextCarried(existingCtx);
+          }
+        }
+        let ctx = existingCtx;
+        if (!ctx) {
+          const created = await this.createRequestContext(c, requestId, params);
+          if (isWebResponse(created)) {
+            return created;
+          }
+          ctx = created;
+        }
 
         // Emit request event
         this.emit("request", {
@@ -489,7 +496,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
         // Untrack connection when request completes
         this.untrackConnection(connectionId);
         // Clean up context store to prevent memory leaks
-        this.requestContextStore.delete(requestId);
+        this.requestContextStore.delete(c.req.raw);
       }
     });
   }
@@ -643,30 +650,46 @@ export class HonoServerAdapter extends BaseServerAdapter {
         const params = c.req.param() as Record<string, string>;
 
         // Get or generate request ID for context lookup
-        const requestId =
-          c.req.header("X-Request-ID") || this.generateRequestId();
+        const requestId = this.requestIdFor(c);
 
         // Reuse existing context from previous middleware if available
-        let ctx = this.requestContextStore.get(requestId);
+        let ctx = this.requestContextStore.get(c.req.raw);
         if (!ctx) {
           // Create new context for the first middleware
-          ctx = this.createContext({
-            requestId,
-            method: c.req.method,
-            path: c.req.path,
-            headers: this.extractHeaders(c),
-            query: this.extractQuery(c),
-            params,
-            body: await this.extractBody(c),
-          });
-          // Store context for sharing between middleware and route handlers
-          this.requestContextStore.set(requestId, ctx);
+          const created = await this.createRequestContext(c, requestId, params);
+          if (isWebResponse(created)) {
+            return created;
+          }
+          ctx = created;
+          // Share the context between the middleware steps and the route
+          // handler when the server carries middleware state, or when the
+          // caller sent its own X-Request-ID: the one case the old store, keyed
+          // by that header, ever found a context again. Otherwise every step
+          // and the handler build their own, and storing this one would only
+          // leave it behind.
+          if (this.carriesMiddlewareState() || c.req.header("X-Request-ID")) {
+            this.requestContextStore.set(c.req.raw, ctx);
+          }
         }
 
         // Execute middleware
         return middleware.handler(ctx, next);
       });
     }
+  }
+
+  /**
+   * The id of this request: the caller's `X-Request-ID` when sent, otherwise
+   * one generated on first use, and the same one on every later use.
+   */
+  private requestIdFor(c: HonoContext): string {
+    const known = this.requestIds.get(c.req.raw);
+    if (known) {
+      return known;
+    }
+    const id = c.req.header("X-Request-ID") || this.generateRequestId();
+    this.requestIds.set(c.req.raw, id);
+    return id;
   }
 
   /**
@@ -866,6 +889,52 @@ export class HonoServerAdapter extends BaseServerAdapter {
     return query;
   }
 
+  /**
+   * A request's context, or the 413 that answers a JSON or form body over its
+   * limit. That answer is built here, before the context exists, so no
+   * middleware (an auth check included) and no route runs for the request.
+   * An upload over the limit still reaches its route as the error itself,
+   * which answers in its own wire format.
+   */
+  private async createRequestContext(
+    c: HonoContext,
+    requestId: string,
+    params: Record<string, string>,
+  ): Promise<ServerContext | Response> {
+    const body = await this.extractBody(c);
+    if (
+      body instanceof RawBodyTooLargeError &&
+      !isRawBodyContentType(c.req.header("Content-Type"))
+    ) {
+      logger.warn("[HonoAdapter] Request rejected", {
+        requestId,
+        code: "PAYLOAD_TOO_LARGE",
+        error: body.message,
+      });
+      this.emitRequestError({
+        requestId,
+        error: body,
+        timestamp: new Date(),
+      });
+      return c.json(
+        {
+          error: { code: "PAYLOAD_TOO_LARGE", message: body.message },
+          metadata: { requestId, timestamp: new Date().toISOString() },
+        },
+        413,
+      );
+    }
+    return this.createContext({
+      requestId,
+      method: c.req.method,
+      path: c.req.path,
+      headers: this.extractHeaders(c),
+      query: this.extractQuery(c),
+      params,
+      body,
+    });
+  }
+
   private async extractBody(c: HonoContext): Promise<unknown> {
     if (!this.config.bodyParser.enabled) {
       return undefined;
@@ -873,17 +942,34 @@ export class HonoServerAdapter extends BaseServerAdapter {
 
     const contentType = c.req.header("Content-Type") || "";
 
-    if (contentType.includes("application/json")) {
+    // JSON and url-encoded forms are read through the same bounded read as
+    // uploads, with the limits the other adapters apply: `jsonLimit` for JSON,
+    // `maxSize` for forms. The bytes are then parsed the way Hono parses a
+    // body it has already buffered. A body that cannot be read or parsed is
+    // `undefined`, as it was when Hono did the reading.
+    const isJson = contentType.includes("application/json");
+    if (isJson || contentType.includes("application/x-www-form-urlencoded")) {
       try {
-        return await c.req.json();
-      } catch {
-        return undefined;
-      }
-    }
-
-    if (contentType.includes("application/x-www-form-urlencoded")) {
-      try {
-        return await c.req.parseBody();
+        const bytes = await readBoundedRequestBody(
+          c.req.raw,
+          parseByteLimit(
+            isJson
+              ? this.config.bodyParser.jsonLimit
+              : this.config.bodyParser.maxSize,
+          ),
+        );
+        if (bytes instanceof RawBodyTooLargeError) {
+          return bytes;
+        }
+        return isJson
+          ? JSON.parse(new TextDecoder().decode(bytes))
+          : await this.parseFormBody(
+              new Request(c.req.url, {
+                method: "POST",
+                headers: { "Content-Type": contentType },
+                body: new Uint8Array(bytes),
+              }),
+            );
       } catch {
         return undefined;
       }
@@ -894,36 +980,10 @@ export class HonoServerAdapter extends BaseServerAdapter {
     // a throw from the middleware path would land in onError, which answers
     // 500. The route answers 413 (or a validation error) from it.
     if (isRawBodyContentType(contentType)) {
-      const limit = parseByteLimit(this.config.bodyParser.maxSize);
-      if (Number(c.req.header("Content-Length") ?? 0) > limit) {
-        return new RawBodyTooLargeError(limit);
-      }
-      // Read the web stream chunk by chunk and stop at the limit, so a
-      // chunked upload without a Content-Length cannot be buffered whole
-      // (and that before any route logic, including the API-key check, runs).
-      // The body is extracted more than once per request (middleware and
-      // route); a web stream can only be read once, so the outcome is kept
-      // per request the way Hono caches `arrayBuffer()`.
-      const cached = rawBodies.get(c.req.raw);
-      if (cached !== undefined) {
-        return cached;
-      }
-      const stream = c.req.raw.body;
-      if (!stream) {
-        return Buffer.alloc(0);
-      }
-      let outcome: Buffer | RawBodyTooLargeError;
-      try {
-        outcome = await readRawBody(webStreamChunks(stream), limit);
-      } catch (error) {
-        if (!(error instanceof RawBodyTooLargeError)) {
-          throw error;
-        }
-        await stream.cancel().catch(() => undefined);
-        outcome = error;
-      }
-      rawBodies.set(c.req.raw, outcome);
-      return outcome;
+      return readBoundedRequestBody(
+        c.req.raw,
+        parseByteLimit(this.config.bodyParser.rawMaxSize),
+      );
     }
 
     return undefined;

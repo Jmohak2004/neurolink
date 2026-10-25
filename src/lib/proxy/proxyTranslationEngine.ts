@@ -44,6 +44,7 @@ import {
   registerProxyResponseObserver,
 } from "./proxyActivity.js";
 import { getProxyUpstreamFailure } from "./proxyFailureDetails.js";
+import { createProxyImageVetter } from "./proxyImageInput.js";
 import { sanitizeForLog } from "../utils/logSanitize.js";
 import { createProxyRouteBodyCapture } from "./proxyRouteBodyCapture.js";
 import { DEFAULT_PROXY_MODEL_IDS } from "../constants/proxyModels.js";
@@ -418,6 +419,10 @@ function createTranslationRequest(args: {
   let budgetLease: ProxyTokenBudgetLease | undefined;
   let budgetSettlement: Promise<void> | undefined;
   let terminalWork: Promise<void> | undefined;
+  // The SDK reads a local path or fetches an http(s) URL named in an image slot,
+  // so a client's references are resolved here, once per request, and the SDK is
+  // handed only what this vetted.
+  const imageVetter = createProxyImageVetter();
   let attempt: ProxyTranslationAttempt | undefined;
   let iterator: AsyncIterator<unknown> | undefined;
   let firstUsefulOutputMs: number | undefined;
@@ -580,6 +585,11 @@ function createTranslationRequest(args: {
       cleanupIterator();
     },
     stream,
+    // The race is kept so an abort still rejects at once, as it did before the
+    // vetter could be cancelled; the signal is what stops the download itself.
+    vetImages: (body: object, abort: AbortSignal) =>
+      raceWithAbort(imageVetter.vet(body, abort), abort),
+    withVettedImages: <T extends object>(body: T): T => imageVetter.apply(body),
     cancel(reason?: unknown) {
       controller.abort(reason);
     },
@@ -623,6 +633,7 @@ async function* runTranslationAttempts(args: {
   format: ProxyFormat;
   parsed: ParsedClaudeRequest | ParsedOpenAIRequest | ParsedGeminiRequest;
   attempts: ProxyTranslationAttempt[];
+  tracer?: ProxyTracer;
   requestStartTime: number;
   request: ReturnType<typeof createTranslationRequest>;
   options?: Parameters<ServerContext["neurolink"]["stream"]>[0];
@@ -661,6 +672,7 @@ async function* runTranslationAttempts(args: {
         ...args.options,
         abortSignal: signal,
       };
+      await request.vetImages(options, signal);
       const prepared = prepareProxyRequestContext({
         provider: attempt.provider ?? "auto",
         model: attempt.model ?? parsed.model,
@@ -750,16 +762,21 @@ async function* runTranslationAttempts(args: {
         },
       });
       recordAttempt(attempt.label ?? "translation", "translation");
-      const result = await raceWithAbort(
+      const modelCall = () =>
         ctx.neurolink.stream(
-          prepared.body as Parameters<typeof ctx.neurolink.stream>[0],
-        ),
+          request.withVettedImages(prepared.body) as Parameters<
+            typeof ctx.neurolink.stream
+          >[0],
+        );
+      const result = await raceWithAbort(
+        args.tracer ? args.tracer.runModelCall(modelCall) : modelCall(),
         signal,
       );
       request.setResult(result);
-      const iterator = (result.stream as AsyncIterable<unknown>)[
+      const source = (result.stream as AsyncIterable<unknown>)[
         Symbol.asyncIterator
       ]();
+      const iterator = args.tracer ? args.tracer.modelStream(source) : source;
       request.setIterator(iterator);
       let hasText = false;
       while (true) {

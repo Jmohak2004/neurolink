@@ -17,13 +17,16 @@
  * is regenerated. Each anchor first checks that its source page still carries
  * the span, so an edited page fails as a stale anchor rather than passing.
  *
- * Two groups of cases load a plugin helper (`headingId.js`, `truncate.js`)
- * directly instead of reading the artifact. That is the determinism exception
- * to CLAUDE.md rule 15: both are pure functions of a string, and the cases need
- * inputs no docs page can be made to contain on demand (a sentence end exactly
- * at the limit, an abbreviation's dot as the last sentence end that fits, a
- * 100-character unbroken token, a surrogate pair astride the cut). They are
- * dependency-free so the suite can load them without the docs site's packages.
+ * Three groups of cases load a plugin helper (`headingId.js`, `truncate.js`,
+ * `stripMarkdown.js`) directly instead of reading the artifact. That is the
+ * determinism exception to CLAUDE.md rule 15: all three are pure functions of a
+ * string, and the cases need inputs no docs page can be made to contain on
+ * demand (a sentence end exactly at the limit, an abbreviation's dot as the
+ * last sentence end that fits, a 100-character unbroken token, a surrogate pair
+ * astride the cut, a `~~~` fence or one that never closes, of which no page
+ * under `docs/` has any, so the artifact cannot show a regression there). They
+ * are dependency-free so the suite can load them without the docs site's
+ * packages.
  *
  * Run: pnpm run test:docs-search-index
  */
@@ -34,7 +37,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assert, defineSuite } from "./helpers/harness.js";
 
-const { test, runSuite } = defineSuite("Docs search index keeps inline code");
+// Offline, so a failure is never read as a skip: the harness downgrades an
+// error whose message merely mentions an API key to a skip in a live suite, and
+// these assertions quote names like OPENAI_API_KEY.
+const { test, runSuite } = defineSuite("Docs search index keeps inline code", {
+  offline: true,
+});
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -98,6 +106,79 @@ await test("no parking placeholder leaks into the index", () => {
   assert(
     !records.some((r) => r.content.includes(nul)),
     "a code-span placeholder was left in the generated index",
+  );
+});
+
+// The emphasis pass read `_` between words as emphasis, so a name written as
+// plain text, outside backticks, lost its underscores: "(OPENAI_API_KEY in this
+// case)" reached the index as "(OPENAIAPIKEY in this case)". CommonMark has no
+// emphasis with `_` inside a word, so a name like that must keep them. The page
+// is synced from docs/provider-status-monitoring.md to
+// /docs/observability/provider-status, so its URL is not its source path.
+await test("an environment variable written as plain text keeps its underscores", () => {
+  const docPath = "docs/provider-status-monitoring.md";
+  const source = readFileSync(path.join(ROOT, docPath), "utf8");
+  assert(
+    source.includes("environment variable (OPENAI_API_KEY in this case)"),
+    `precondition: ${docPath} no longer names OPENAI_API_KEY outside backticks; pick another`,
+  );
+  const page = records.filter((r) =>
+    r.url.startsWith("/docs/observability/provider-status#"),
+  );
+  assert(
+    page.length > 0,
+    "precondition: the index has no section records for /docs/observability/provider-status",
+  );
+  assert(
+    page.some((r) => r.content.includes("(OPENAI_API_KEY in this case)")),
+    "a plain-text environment variable lost its underscores to the emphasis pass",
+  );
+  const garbled = records.filter(
+    (r) =>
+      r.content.includes("OPENAIAPIKEY") || r.content.includes("OPENAIBASEURL"),
+  );
+  assert(
+    garbled.length === 0,
+    `${garbled.length} record(s) carry an environment variable with its underscores stripped, for example ${garbled[0]?.url}`,
+  );
+});
+
+// The other side of that fix: emphasis whose underscores stand apart from the
+// words around them is still emphasis, and still goes.
+await test("underscore emphasis around a whole word is still removed", () => {
+  const docPath = "docs/about/why-the-core-stays-thin.md";
+  const source = readFileSync(path.join(ROOT, docPath), "utf8");
+  assert(
+    source.includes("being _lazy_ on top of"),
+    `precondition: ${docPath} no longer has the emphasised word; pick another`,
+  );
+  const page = pageRecords(docPath);
+  assert(
+    page.length > 0,
+    `precondition: the index has no records for ${docPath}`,
+  );
+  assert(
+    page.some((r) => r.content.includes("being lazy on top of")),
+    "underscore emphasis around a whole word was not removed",
+  );
+  assert(
+    !page.some((r) => r.content.includes("_lazy_")),
+    "underscore emphasis reached the index with its underscores intact",
+  );
+});
+
+// A fence opened with `~~~` is code exactly as one opened with backticks, and
+// the plugin has to drop it the same way. No docs page has a tilde fence today,
+// so this case has no page to anchor on and checks the whole artifact: a fenced
+// block that slipped through would leave its opening or closing line in a
+// record. With no such page it passes whether or not the tilde handling exists;
+// the fixture cases at the end of this file are what would fail, and this one
+// only catches a page that adds a fence the plugin then fails to drop.
+await test("no record carries a tilde-fenced block", () => {
+  const leaked = records.filter((r) => /^[ \t]*~{3,}/m.test(r.content));
+  assert(
+    leaked.length === 0,
+    `${leaked.length} record(s) carry a ~~~ fence line, for example ${leaked[0]?.url}`,
   );
 });
 
@@ -504,6 +585,129 @@ await test("the truncation helper does not end a section on an abbreviation", ()
     assert(
       truncate(input, max) === expected,
       `${label}: the helper returned a different cut than expected`,
+    );
+  }
+});
+
+// `stripMarkdown` on fixtures. The artifact cases above can only see the fences
+// and underscores that docs pages contain; no page has a `~~~` fence, so
+// reverting the tilde handling would leave them all passing. These feed the
+// helper inputs of our own.
+type MarkdownStripper = (markdown: string) => string;
+const loadStripMarkdown = (): MarkdownStripper => {
+  try {
+    return (
+      requireFromHere(
+        path.join(
+          ROOT,
+          "docs-site",
+          "plugins",
+          "docusaurus-plugin-search-index",
+          "stripMarkdown.js",
+        ),
+      ) as { stripMarkdown: MarkdownStripper }
+    ).stripMarkdown;
+  } catch {
+    throw new Error("the plugin's stripMarkdown helper could not be loaded");
+  }
+};
+
+await test("a ~~~ fenced block is dropped with its code and its fence lines", () => {
+  const strip = loadStripMarkdown();
+  const cases: Array<[string, string, string]> = [
+    [
+      "a tilde fence with an info string",
+      "Before\n\n~~~bash\necho fenced-unique-9f3a\n~~~\n\nAfter",
+      "Before\n\nAfter",
+    ],
+    [
+      "a longer fence is not closed by a shorter tilde line",
+      "Before\n\n~~~~md\ncode-inner-1\n~~~\ncode-inner-2\n~~~~\n\nAfter",
+      "Before\n\nAfter",
+    ],
+    [
+      "a tilde line with text after it does not close the fence",
+      "Before\n\n~~~\ncode-inner-1\n~~~ x\ncode-inner-2\n~~~\n\nAfter",
+      "Before\n\nAfter",
+    ],
+    [
+      "a fence may be indented up to three spaces",
+      "Before\n\n   ~~~\ncode-indented\n   ~~~\n\nAfter",
+      "Before\n\nAfter",
+    ],
+    [
+      "a tilde line inside a backtick fence opens nothing",
+      "Before\n```\n~~~\ncode-in-ticks\n```\nAfter",
+      "Before\n\nAfter",
+    ],
+    [
+      "a backtick fence is still dropped",
+      "Before\n```js\ncode-tick\n```\nAfter",
+      "Before\n\nAfter",
+    ],
+    [
+      "four spaces of indent is an indented code block, not a fence",
+      "Before\n\n    ~~~\n    kept code\n    ~~~\n\nAfter",
+      "Before\n\n    ~~~\n    kept code\n    ~~~\n\nAfter",
+    ],
+    [
+      "three tildes in a sentence are text",
+      "Use ~~~ inline.",
+      "Use ~~~ inline.",
+    ],
+  ];
+  for (const [label, input, expected] of cases) {
+    const got = strip(input);
+    assert(
+      got === expected,
+      `${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(got)}`,
+    );
+  }
+});
+
+await test("a ~~~ fence that never closes drops everything after it", () => {
+  const strip = loadStripMarkdown();
+  const cases: Array<[string, string]> = [
+    ["Before\n\n~~~\ncode-unclosed\nmore code", "Before"],
+    ["Before\n\n  ~~~python\ncode-unclosed\n", "Before"],
+  ];
+  for (const [input, expected] of cases) {
+    const got = strip(input);
+    assert(
+      got === expected,
+      `an unclosed fence: expected ${JSON.stringify(expected)}, got ${JSON.stringify(got)}`,
+    );
+  }
+});
+
+await test("underscores inside a word survive the emphasis pass", () => {
+  const strip = loadStripMarkdown();
+  const input =
+    "Set OPENAI_API_KEY and OPENAI_BASE_URL, or snake_case_name, FOO__BAR and naïve_café_bar.";
+  const got = strip(input);
+  assert(
+    got === input,
+    `intraword underscores changed: expected ${JSON.stringify(input)}, got ${JSON.stringify(got)}`,
+  );
+});
+
+await test("emphasis around a whole word is still stripped, beside a name that keeps its underscores", () => {
+  const strip = loadStripMarkdown();
+  const cases: Array<[string, string]> = [
+    [
+      "An _emphasised_ word, __strong__, ___both___, *italic*, **bold**, ***both***.",
+      "An emphasised word, strong, both, italic, bold, both.",
+    ],
+    [
+      "Use _this_ with OPENAI_API_KEY (_and_ that), `A_B_C`.",
+      "Use this with OPENAI_API_KEY (and that), A_B_C.",
+    ],
+  ];
+  for (const [input, expected] of cases) {
+    const got = strip(input);
+    assert(
+      got === expected,
+      `emphasis: expected ${JSON.stringify(expected)}, got ${JSON.stringify(got)}`,
     );
   }
 });

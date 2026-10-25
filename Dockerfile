@@ -50,6 +50,10 @@ COPY --from=build /app/dist ./dist
 COPY docs/assets/dashboards ./docs/assets/dashboards
 COPY docs-site/mcp-server/*.js docs-site/mcp-server/*.d.ts ./docs-site/mcp-server/
 COPY docs-site/static/search-index.json ./docs-site/static/search-index.json
+# Whistle (local STT) and Silero (the streaming speech detector) load from here;
+# without them a pod downloads both at first use, or falls back to the energy gate.
+COPY models/whistle ./models/whistle
+COPY models/silero-vad ./models/silero-vad
 COPY scripts/observability ./scripts/observability
 # Never runs as root. HOME holds the CLI's state file (~/.neurolink).
 USER node
@@ -57,5 +61,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/api/health/live').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
 # exec form: node is PID 1 and receives SIGTERM directly; `serve` drains and exits.
+# --debug logs each request's warnings and errors; NEUROLINK_DEBUG alone does
+# not, because the CLI resets it unless the flag is passed.
 ENTRYPOINT ["node", "/app/dist/cli/index.js"]
-CMD ["serve", "--host", "0.0.0.0", "--quiet"]
+CMD ["serve", "--host", "0.0.0.0", "--debug"]

@@ -21,6 +21,7 @@ import type { CommandModule, Argv } from "yargs";
 import { registerCliShutdownOwner } from "../lifecycle.js";
 import { writeFileAtomic } from "../proxy-clients/snapshot.js";
 import { spawn } from "node:child_process";
+import { Server as HttpServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -46,6 +47,8 @@ import {
   restoreAllClients,
 } from "../proxy-clients/registry.js";
 import { resolveProxyConfigPath } from "../../lib/proxy/proxyConfig.js";
+import { readProxyRequestText } from "../../lib/proxy/requestBodyLimit.js";
+import { RawBodyTooLargeError } from "../../lib/server/utils/rawBody.js";
 import {
   redactUrlsInText,
   sanitizeForLog,
@@ -217,6 +220,20 @@ const PROXY_TELEMETRY_SCRIPT_PATH = fileURLToPath(
 const gatedShareRequests = new WeakSet<Request>();
 
 const PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS = 5_000;
+/** Reverse proxies in front of this server (cloudflared keeps idle origin
+ *  connections for 90s) reuse sockets longer than Node's 5s default. A socket
+ *  the server closes while the tunnel sends a POST on it surfaces as a 502,
+ *  because a POST is never retried, so the server must be the side that waits
+ *  longer. headersTimeout has to exceed it, or Node cuts idle sockets early. */
+const PROXY_SERVER_KEEP_ALIVE_TIMEOUT_MS = 120_000;
+const PROXY_SERVER_HEADERS_TIMEOUT_MS = 125_000;
+
+function extendProxyServerKeepAlive(server: unknown): void {
+  if (server instanceof HttpServer) {
+    server.keepAliveTimeout = PROXY_SERVER_KEEP_ALIVE_TIMEOUT_MS;
+    server.headersTimeout = PROXY_SERVER_HEADERS_TIMEOUT_MS;
+  }
+}
 // Allow the normal 30-second worker drain plus startup settlement, leaving
 // telemetry and scheduling headroom inside launchd's 45-second stop budget.
 const PROXY_SUPERVISOR_DRAIN_TIMEOUT_MS = 35_000;
@@ -2041,6 +2058,21 @@ export async function createProxyStartApp(params: {
     ]);
   };
 
+  /** 413 in the wire format this proxy answers its other request errors in. */
+  const respondRequestTooLarge = async (
+    c: Context,
+    metadata: RuntimeRequestMetadata | undefined,
+    message: string,
+  ) => {
+    if (metadata) {
+      await recordRuntimeError(metadata, 413, "request_too_large", message);
+    }
+    return c.json(
+      { type: "error", error: { type: "request_too_large", message } },
+      413,
+    );
+  };
+
   app.onError(async (err, c) => {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.always(`[proxy] unhandled error: ${errMsg}`);
@@ -2295,7 +2327,13 @@ export async function createProxyStartApp(params: {
       let body: unknown;
       let rawBody: string | undefined;
       if (method === "post") {
-        rawBody = await c.req.text().catch(() => undefined);
+        // Bounded before it is parsed, and so before the share gate below
+        // (which needs the model), the way the server adapters bound theirs.
+        const read = await readProxyRequestText(c.req.raw, route.path);
+        if (read instanceof RawBodyTooLargeError) {
+          return respondRequestTooLarge(c, metadata, read.message);
+        }
+        rawBody = read;
         try {
           body = rawBody ? JSON.parse(rawBody) : emptyBody;
         } catch {
@@ -3175,7 +3213,7 @@ async function refreshProxyTokensInBackground(
   accountAllowlist?: AccountAllowlist,
 ): Promise<void> {
   const {
-    needsRefresh,
+    needsBackgroundRefresh,
     refreshToken,
     persistTokens,
     isPermanentRefreshFailure,
@@ -3205,7 +3243,7 @@ async function refreshProxyTokensInBackground(
           refreshToken: tokens.refreshToken,
           expiresAt: tokens.expiresAt,
         };
-        if (!needsRefresh(account)) {
+        if (!needsBackgroundRefresh(account)) {
           backgroundRefreshFailures.delete(key);
           continue;
         }
@@ -3265,7 +3303,7 @@ async function refreshProxyTokensInBackground(
       expiresAt: creds.oauth.expiresAt,
     };
     const legacyKey = LEGACY_ANTHROPIC_ACCOUNT_KEY;
-    if (!needsRefresh(account)) {
+    if (!needsBackgroundRefresh(account)) {
       backgroundRefreshFailures.delete(legacyKey);
       return;
     }
@@ -3447,10 +3485,15 @@ function registerProxyShutdownHandlers(params: {
     const requestLogsFlush = import("../../lib/proxy/requestLogger.js").then(
       ({ flushRequestLogs }) => flushRequestLogs(),
     );
+    const snapshotWritesFlush =
+      import("../../lib/proxy/snapshotPersistence.js").then(
+        ({ flushSnapshotWrites }) => flushSnapshotWrites(),
+      );
     const [
       usageStatsFlushResult,
       lifecycleFlushResult,
       requestLogsFlushResult,
+      snapshotWritesFlushResult,
     ] = await Promise.allSettled([
       withTimeout(
         usageStatsFlush,
@@ -3465,6 +3508,11 @@ function registerProxyShutdownHandlers(params: {
       // This flush owns a separate bounded budget covering the body worker
       // deadline plus index/OTLP publication; do not truncate it to five seconds.
       requestLogsFlush,
+      withTimeout(
+        snapshotWritesFlush,
+        PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+        "Timed out flushing proxy snapshot writes during shutdown",
+      ),
     ]);
     if (usageStatsFlushResult.status === "rejected") {
       const error = usageStatsFlushResult.reason;
@@ -3482,6 +3530,12 @@ function registerProxyShutdownHandlers(params: {
       const error = requestLogsFlushResult.reason;
       logger.warn(
         `[proxy] request log flush failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (snapshotWritesFlushResult.status === "rejected") {
+      const error = snapshotWritesFlushResult.reason;
+      logger.warn(
+        `[proxy] snapshot write flush failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
 
@@ -3568,6 +3622,7 @@ async function startProxyRuntime(params: {
         port: params.port,
         hostname: params.host,
       });
+  extendProxyServerKeepAlive(server);
   // The gate-only listener. It exists only while this node lends something, and
   // it is the port an operator exposes: the main port keeps serving the
   // operator's own untokened client exactly as before.
@@ -3607,6 +3662,7 @@ async function startProxyRuntime(params: {
                   resolve(started);
                 },
               );
+              extendProxyServerKeepAlive(started);
               started.on("error", (error: Error) => {
                 if (!listening) {
                   reject(error);

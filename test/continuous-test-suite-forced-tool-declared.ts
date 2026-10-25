@@ -44,7 +44,7 @@ import {
   runNativeGenerateLoop,
 } from "../src/lib/core/nativeGenerateLoop.js";
 import { logger } from "../src/lib/utils/logger.js";
-import type { StepToolChoiceInput } from "../src/lib/types/index.js";
+import type { StepToolChoiceInput, Tool } from "../src/lib/types/index.js";
 
 type Warning = { message: string; data: Record<string, unknown> };
 type PrepareStepHook = NonNullable<StepToolChoiceInput["prepareStep"]>;
@@ -380,44 +380,252 @@ void runSuite(async () => {
     assertEqual(after.warnings.length, 0);
   });
 
-  await test("generate loop: a forced tool hydrated into the live record but absent from the request's tools is not sent", async () => {
-    // search_tools executes inside the loop and adds crm_lookup to the live
-    // record; the loop's `tools` array was built once, so the request never
-    // declares it. The record says "declared", the wire says "not offered".
+  // search_tools executes inside the loop and adds crm_lookup to the live
+  // record. The loop declares it on the next step by default, for every
+  // provider that runs it, so the model can call it and a caller can force it.
+  // Each run builds its own record and request tools: the loop appends the new
+  // declaration to the caller's array in place.
+  const runWithHydration = async (
+    forcedName: string,
+    options: {
+      declareTool?: (name: string, tool: Tool) => Record<string, unknown>;
+    } = {},
+  ) => {
     const live = Object.create(null) as Record<string, unknown>;
     live.get_time = { description: "time", execute: async () => ({ now: 1 }) };
     live.search_tools = {
       description: "search",
       execute: async () => {
-        live.crm_lookup = { description: "crm", execute: async () => ({}) };
+        live.crm_lookup = {
+          description: "crm",
+          inputSchema: { jsonSchema: { type: "object", properties: {} } },
+          execute: async () => ({ found: 1 }),
+        };
         return { found: 1 };
       },
     };
-    const requestTools = Object.entries(live).map(([name, entry]) => ({
+    const requestTools: Array<Record<string, unknown>> = Object.entries(
+      live,
+    ).map(([name, entry]) => ({
       type: "function",
       name,
       description: (entry as { description: string }).description,
       inputSchema: { type: "object", properties: {} },
     }));
-    const run = async (forcedName: string) => {
-      const sent: Array<{ names: string[]; toolChoice: unknown }> = [];
+    const sent: Array<{ names: string[]; toolChoice: unknown }> = [];
+    let call = 0;
+    const doGenerate = async (request: Record<string, unknown>) => {
+      sent.push({
+        names: ((request.tools as Array<{ name: string }>) ?? []).map(
+          (declared) => declared.name,
+        ),
+        toolChoice: request.toolChoice,
+      });
+      const step = call++;
+      return step === 0
+        ? {
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: "call-1",
+                toolName: "search_tools",
+                input: '{"query":"crm"}',
+              },
+            ],
+            finishReason: { unified: "tool-calls" },
+            usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+          }
+        : {
+            content: [{ type: "text", text: "done" }],
+            finishReason: { unified: "stop" },
+            usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+          };
+    };
+    const { warnings } = await captureWarnings(() =>
+      runNativeGenerateLoop(
+        {
+          provider: "probe",
+          doGenerate,
+          conversation: [{ role: "user", content: "hi" }],
+          tools: requestTools,
+          toolsRecord: live as Record<string, Tool>,
+          ...(options.declareTool ? { declareTool: options.declareTool } : {}),
+          prepareStep: async ({ stepNumber }) =>
+            stepNumber === 1
+              ? ({ toolChoice: forceTool(forcedName) } as Awaited<
+                  ReturnType<PrepareStepHook>
+                >)
+              : undefined,
+          modelId: "test-model",
+          maxSteps: 4,
+          runStep: (invoke) => invoke(),
+        },
+        [],
+      ),
+    );
+    return { second: sent[1], warnings, requestTools };
+  };
+
+  await test("generate loop: a tool the live record gains mid-turn is declared on the next request without any provider hook, so it can be forced", async () => {
+    const run = await runWithHydration("crm_lookup");
+    assert(
+      run.second.names.includes("crm_lookup"),
+      "the next request declares the tool search_tools loaded",
+    );
+    const choice = run.second.toolChoice as { toolName?: string };
+    assertEqual(
+      choice.toolName,
+      "crm_lookup",
+      "a declared tool is forced, as an offered one always is",
+    );
+    assertEqual(run.warnings.length, 0, "nothing is dropped, so nothing warns");
+    assertEqual(run.requestTools.length, 3, "the caller's array grew in place");
+    assertEqual(
+      JSON.stringify(run.requestTools[2]),
+      JSON.stringify({
+        type: "function",
+        name: "crm_lookup",
+        description: "crm",
+        inputSchema: { type: "object", properties: {} },
+      }),
+      "the provider-neutral declaration",
+    );
+  });
+
+  await test("generate loop: an offered tool is still forced and nothing is declared twice", async () => {
+    const run = await runWithHydration("get_time");
+    const choice = run.second.toolChoice as { toolName?: string };
+    assertEqual(choice.toolName, "get_time", "an offered tool is forced");
+    assertEqual(run.warnings.length, 0);
+    assertEqual(
+      run.second.names.filter((name) => name === "get_time").length,
+      1,
+      "get_time is declared once",
+    );
+  });
+
+  await test("generate loop: a provider's own declareTool still takes over the declaration", async () => {
+    const run = await runWithHydration("crm_lookup", {
+      declareTool: (name) => ({
+        type: "function",
+        name,
+        description: "custom",
+        inputSchema: { type: "object", properties: { custom: {} } },
+      }),
+    });
+    assertEqual(
+      (run.requestTools[2] as { description?: string }).description,
+      "custom",
+      "the override built the declaration",
+    );
+  });
+
+  await test("generate loop: a tool whose lazy input schema throws is declared with an empty object schema instead of failing the step", async () => {
+    const live = Object.create(null) as Record<string, unknown>;
+    live.search_tools = {
+      description: "search",
+      execute: async () => {
+        live.broken_lazy = {
+          description: "broken",
+          inputSchema: () => {
+            throw new Error("lazy schema failed");
+          },
+          execute: async () => ({}),
+        };
+        return { found: 1 };
+      },
+    };
+    const requestTools: Array<Record<string, unknown>> = [
+      {
+        type: "function",
+        name: "search_tools",
+        description: "search",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ];
+    let call = 0;
+    const doGenerate = async () =>
+      call++ === 0
+        ? {
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: "call-1",
+                toolName: "search_tools",
+                input: '{"query":"x"}',
+              },
+            ],
+            finishReason: { unified: "tool-calls" },
+            usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+          }
+        : {
+            content: [{ type: "text", text: "done" }],
+            finishReason: { unified: "stop" },
+            usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+          };
+    const { warnings } = await captureWarnings(() =>
+      runNativeGenerateLoop(
+        {
+          provider: "probe",
+          doGenerate,
+          conversation: [{ role: "user", content: "hi" }],
+          tools: requestTools,
+          toolsRecord: live as Record<string, Tool>,
+          modelId: "test-model",
+          maxSteps: 3,
+          runStep: (invoke) => invoke(),
+        },
+        [],
+      ),
+    );
+    assertEqual(requestTools.length, 2, "the tool was still declared");
+    assertEqual(
+      JSON.stringify(requestTools[1]),
+      JSON.stringify({
+        type: "function",
+        name: "broken_lazy",
+        description: "broken",
+        inputSchema: { type: "object", properties: {} },
+      }),
+      "with the empty object schema",
+    );
+    assert(
+      warnings.some((entry) => entry.message.includes("broken_lazy")),
+      "and the fallback is warned about, naming the tool",
+    );
+  });
+
+  // validateToolInput reads `safeParse` off the tool's input schema. A schema
+  // that is not an object (a host's hand-built tool, or a lazy schema that
+  // resolves to a primitive) used to throw a TypeError on the `in` check and
+  // take the whole turn down; the tool has no validator to ask, so it runs.
+  for (const [label, inputSchema] of [
+    ["a string", "not-a-schema"],
+    ["a number", 7],
+    ["a lazy schema that resolves to a string", () => "not-a-schema"],
+  ] as const) {
+    await test(`generate loop: a tool whose input schema is ${label} runs instead of crashing the turn`, async () => {
+      let executed = 0;
+      const rejected: string[] = [];
+      const record = Object.create(null) as Record<string, unknown>;
+      record.probe_tool = {
+        description: "probe",
+        inputSchema,
+        execute: async () => {
+          executed += 1;
+          return { ok: true };
+        },
+      };
       let call = 0;
-      const doGenerate = async (options: Record<string, unknown>) => {
-        sent.push({
-          names: ((options.tools as Array<{ name: string }>) ?? []).map(
-            (declared) => declared.name,
-          ),
-          toolChoice: options.toolChoice,
-        });
-        const step = call++;
-        return step === 0
+      const doGenerate = async () =>
+        call++ === 0
           ? {
               content: [
                 {
                   type: "tool-call",
                   toolCallId: "call-1",
-                  toolName: "search_tools",
-                  input: '{"query":"crm"}',
+                  toolName: "probe_tool",
+                  input: '{"query":"x"}',
                 },
               ],
               finishReason: { unified: "tool-calls" },
@@ -428,55 +636,31 @@ void runSuite(async () => {
               finishReason: { unified: "stop" },
               usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
             };
-      };
-      const { warnings } = await captureWarnings(() =>
-        runNativeGenerateLoop(
-          {
-            provider: "probe",
-            doGenerate,
-            conversation: [{ role: "user", content: "hi" }],
-            tools: requestTools,
-            toolsRecord: live,
-            prepareStep: async ({ stepNumber }) =>
-              stepNumber === 1
-                ? ({ toolChoice: forceTool(forcedName) } as Awaited<
-                    ReturnType<PrepareStepHook>
-                  >)
-                : undefined,
-            modelId: "test-model",
-            maxSteps: 4,
-            runStep: (invoke) => invoke(),
+      await runNativeGenerateLoop(
+        {
+          provider: "probe",
+          doGenerate,
+          conversation: [{ role: "user", content: "hi" }],
+          tools: [
+            {
+              type: "function",
+              name: "probe_tool",
+              description: "probe",
+              inputSchema: { type: "object", properties: {} },
+            },
+          ],
+          toolsRecord: record as Record<string, Tool>,
+          onRejectedToolCall: (name) => {
+            rejected.push(name);
           },
-          [],
-        ),
+          modelId: "test-model",
+          maxSteps: 3,
+          runStep: (invoke) => invoke(),
+        },
+        [],
       );
-      return { second: sent[1], warnings };
-    };
-
-    const hydrated = await run("crm_lookup");
-    assertEqual(
-      hydrated.second.toolChoice,
-      undefined,
-      "crm_lookup is in the record but not in the request, so it is not forced",
-    );
-    assertEqual(
-      hydrated.warnings.length,
-      1,
-      "the dropped choice is warned about",
-    );
-    assertEqual(hydrated.warnings[0].data.toolName, "crm_lookup");
-
-    const offered = await run("get_time");
-    const offeredChoice = offered.second.toolChoice as { toolName?: string };
-    assertEqual(
-      offeredChoice.toolName,
-      "get_time",
-      "an offered tool is forced",
-    );
-    assert(
-      offered.second.names.includes("get_time"),
-      "and it is in the request's tools",
-    );
-    assertEqual(offered.warnings.length, 0);
-  });
+      assertEqual(executed, 1, "the tool ran once");
+      assertEqual(rejected.length, 0, "the call was not rejected");
+    });
+  }
 });

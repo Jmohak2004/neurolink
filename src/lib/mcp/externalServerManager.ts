@@ -11,7 +11,10 @@ import { EventEmitter } from "events";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { mcpLogger } from "../utils/logger.js";
-import { MCPClientFactory } from "./mcpClientFactory.js";
+import {
+  MCPClientFactory,
+  terminateLiveStdioServers,
+} from "./mcpClientFactory.js";
 import { ToolDiscoveryService } from "./toolDiscoveryService.js";
 import { toolRegistry } from "./toolRegistry.js";
 import type {
@@ -38,6 +41,7 @@ import { HITLUserRejectedError, HITLTimeoutError } from "../hitl/hitlErrors.js";
 import { detectCategory } from "../utils/mcpDefaults.js";
 
 import { isObject, isNonNullObject } from "../utils/typeUtils.js";
+import { recordMCPToolCall } from "../telemetry/aiMetrics.js";
 import { tracers } from "../telemetry/tracers.js";
 import { SpanStatusCode } from "@opentelemetry/api";
 
@@ -456,6 +460,9 @@ const shutdownOnSignal = (signal: NodeJS.Signals): void => {
     // re-raise and nowhere else.
     if (!hadOtherListeners) {
       process.removeListener(signal, shutdownOnSignal);
+      // Dying of a signal runs no `exit` handler, and the cleanup above reaches
+      // only the servers a manager has recorded and that close when asked.
+      terminateLiveStdioServers();
       process.kill(process.pid, signal);
     }
   });
@@ -2672,8 +2679,9 @@ export class ExternalServerManager extends EventEmitter {
       if (result.success) {
         // A resolved `{ isError: true }` still comes back with success:true so
         // the caller receives the MCP error payload as-is, but it is a failed
-        // call for telemetry: label mcp_tool_calls_total accordingly instead
-        // of counting every resolved error as a success.
+        // call for telemetry: count it in the server's totalErrors and as
+        // success=false in mcp_tool_calls_total instead of counting every
+        // resolved error as a success.
         const resolvedError = result.isErrorResult === true;
         if (resolvedError) {
           instance.metrics.totalErrors++;
@@ -2686,12 +2694,14 @@ export class ExternalServerManager extends EventEmitter {
             duration,
           },
         );
+        recordMCPToolCall(toolName, duration, !resolvedError);
         return result.data;
       } else {
         throw new Error(result.error || "Tool execution failed");
       }
     } catch (error) {
       instance.metrics.totalErrors++;
+      recordMCPToolCall(toolName, Date.now() - startTime, false);
 
       mcpLogger.error(
         `[ExternalServerManager] Tool execution failed: ${toolName} on ${serverId}`,

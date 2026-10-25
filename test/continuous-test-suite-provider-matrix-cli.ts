@@ -23,9 +23,19 @@ import "dotenv/config";
 import { spawn } from "node:child_process";
 import {
   defineSuite,
+  log,
+  logSection,
   Skip,
   isExpectedProviderError,
 } from "./helpers/harness.js";
+import {
+  coverageLines,
+  coverageOf,
+  isExpectedLive,
+  noteQuietSkip,
+  recordCell,
+  settleCell,
+} from "./helpers/liveGate.js";
 import { PROVIDERS, hasProviderEnv } from "./helpers/providerMatrix.js";
 import { assertDistFresh } from "./helpers/distFreshness.js";
 
@@ -123,12 +133,21 @@ function runCli(args: string[]): Promise<CliResult> {
   });
 }
 
-function skipIfProviderError(err: unknown): never {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (isExpectedProviderError(msg)) {
-    throw new Skip(`provider unavailable — ${msg.slice(0, 100)}`);
-  }
-  throw err as Error;
+/**
+ * One cell of the CLI matrix. The body's own catch hands its error to
+ * `settleCell` (test/helpers/liveGate.ts): a keyed provider answering with a
+ * credential, account or rate-limit error FAILS unless the allowlist excuses
+ * it, exactly as in the SDK matrix. A body that returns has passed.
+ */
+function cell(
+  providerName: string,
+  label: string,
+  body: () => Promise<void>,
+): Promise<void> {
+  return test(label, async () => {
+    await body();
+    recordCell(providerName, "passed");
+  });
 }
 
 /**
@@ -152,9 +171,10 @@ function classifyCliFailure(args: string[], result: CliResult): never {
     );
   }
   if (isExpectedProviderError(combined)) {
-    throw new Skip(
-      `provider unavailable — ${combined.slice(0, 120).replace(/\s+/g, " ")}`,
-    );
+    // Not a Skip: the catch around the cell passes it to settleCell, which
+    // decides from the provider and the error whether it is a skip, an
+    // allowlisted failure or a FAIL. The whole text goes through, uncut.
+    throw new Error(combined);
   }
   throw new Error(
     `CLI ${args.join(" ")} exited ${result.exitCode} with unexpected output ` +
@@ -168,8 +188,18 @@ async function runMatrix(): Promise<void> {
       continue;
     }
 
+    // A provider with no secret and no recorded live run has nothing to prove;
+    // spawning the CLI for it only logs an ERROR for the key it was never given.
+    if (!isExpectedLive(p.name)) {
+      noteQuietSkip(p.name);
+      await test(`[${p.name}] not run: no secret and no live evidence`, () => {
+        throw new Skip(`set ${p.envVars[0]} to run it`);
+      });
+      continue;
+    }
+
     // ---------- generate ----------
-    await test(`[${p.name}] CLI generate`, async () => {
+    await cell(p.name, `[${p.name}] CLI generate`, async () => {
       try {
         const result = await runCli([
           "generate",
@@ -186,13 +216,13 @@ async function runMatrix(): Promise<void> {
           classifyCliFailure(["generate", "--provider", p.name], result);
         }
       } catch (err) {
-        skipIfProviderError(err);
+        settleCell(p.name, err);
       }
     });
 
     // ---------- stream ----------
     if (p.streaming) {
-      await test(`[${p.name}] CLI stream`, async () => {
+      await cell(p.name, `[${p.name}] CLI stream`, async () => {
         try {
           let lastResult: CliResult | null = null;
           for (let attempt = 1; attempt <= 2; attempt++) {
@@ -216,10 +246,17 @@ async function runMatrix(): Promise<void> {
             classifyCliFailure(["stream", "--provider", p.name], lastResult);
           }
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
+  }
+
+  logSection("Live gate coverage");
+  for (const line of coverageLines(
+    coverageOf(targets.map((target) => target.name)),
+  )) {
+    log(`  ${line}`, "blue");
   }
 }
 

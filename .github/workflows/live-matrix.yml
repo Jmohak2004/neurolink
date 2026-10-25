@@ -38,7 +38,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -84,7 +84,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -110,6 +110,11 @@ jobs:
         run: pnpm run test:matrix
         timeout-minutes: 30
         env:
+          # Turns on the coverage floor in test/helpers/liveGate.ts: the sweep
+          # fails when fewer than MIN_PASSED_PROVIDERS providers pass, so a
+          # wiped secret group or a harness regression cannot leave it green
+          # with most providers skipped. Local and filtered runs do not set it.
+          LIVE_MATRIX_ENFORCE_FLOOR: "1"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
@@ -421,7 +426,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

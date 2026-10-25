@@ -87,9 +87,39 @@ Tool declarations in the v3 shape doGenerate already knows how to convert.
 
 ### toolsRecord
 
-> **toolsRecord**: `Record`\<`string`, `unknown`\>
+> **toolsRecord**: `Record`\<`string`, [`Tool`](Tool.md)\>
 
-Registered tools, used to execute a call the model asks for.
+Registered tools, used to execute a call the model asks for. Typed
+`Record<string, Tool>`; it was `Record<string, unknown>` before discovery
+learned to declare tools that join it mid-turn, so a caller that builds
+this record from loosely typed tools now needs a cast to `Tool`.
+
+---
+
+### declareTool?
+
+> `optional` **declareTool?**: (`name`, `tool`) => `Record`\<`string`, `unknown`\>
+
+Builds the declaration for a tool that joined `toolsRecord` mid-turn
+(discovery's search_tools loads tools into it). Optional: by default the
+loop declares such a tool in the provider-neutral shape every provider's
+`doGenerate` converts (`toNativeToolDeclaration`), for every provider that
+runs this loop. Set it only to declare in another shape. The loop appends
+the declarations to `tools` in place.
+
+#### Parameters
+
+##### name
+
+`string`
+
+##### tool
+
+[`Tool`](Tool.md)
+
+#### Returns
+
+`Record`\<`string`, `unknown`\>
 
 ---
 

@@ -252,6 +252,8 @@ export {
 } from "./factories/sttDescriptors.js";
 export { buildSpeakerTurns, listSpeakers } from "./utils/speakerTurns.js";
 export { correctTranscript } from "./voice/correction/index.js";
+// Transcription sessions: several speakers, listeners in their own languages.
+export { TranscriptionSession } from "./voice/session/transcriptionSession.js";
 // STT_ERROR_CODES is surfaced via the types barrel (export * from "./types/index.js")
 // STTError is re-exported below from the voice/index.js barrel
 
@@ -380,6 +382,7 @@ export { NeuroLink };
 // Observability configuration types
 
 import {
+  ensureTelemetry,
   flushOpenTelemetry,
   getLangfuseHealthStatus,
   isOpenTelemetryInitialized,
@@ -388,6 +391,7 @@ import {
 } from "./services/server/ai/observability/instrumentation.js";
 
 export {
+  ensureTelemetry,
   shutdownOpenTelemetry,
   flushOpenTelemetry,
   getLangfuseHealthStatus,
@@ -1145,6 +1149,7 @@ export {
   readDecisionBoolean,
   readDecisionChoice,
   readDecisionScore,
+  readDecisionValue,
   servesInferenceKind,
 } from "./utils/decisionAnswers.js";
 // The estimator the pre-flight refusal uses, and the flattening behind

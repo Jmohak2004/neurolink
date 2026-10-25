@@ -286,12 +286,13 @@ TypeSafe and Laya both configured, TypeSafe runs; with only Laya's key and base 
 set, Laya runs.
 
 [**XOR**](docs/getting-started/providers/xor.md) is Juspay's Apache-2.0,
-open-weights decision model (`xor-latest` for text, `xor-omni` for images and video); setup is on
+open-weights decision model (`xor-latest` for text, `xor-omni` for an image, audio and `value` extraction); setup is on
 [Hugging Face](https://huggingface.co/juspay/xor). It has no built-in endpoint
 either: set `XOR_API_KEY` and `XOR_BASE_URL` to the origin of a deployment or of
 a LiteLLM proxy route (or pass `credentials.xor`). XOR counts only with both its
 key and base URL set, and a call can always name it with `provider: "xor"`. It
-accepts images and video, which TypeSafe, Laya, SubQ and ScaleDown refuse.
+accepts one image and one audio clip (WAV, FLAC, Ogg or MP3; it hears the first
+30 seconds), which TypeSafe, Laya, SubQ and ScaleDown refuse. It refuses video.
 
 [**SubQ**](docs/getting-started/providers/subq.md) is Subquadratic's hosted
 decision model, SubQ Snap (`subq-snap-preview`, in public preview; provider id
@@ -491,7 +492,11 @@ NeuroLink includes a **HITL (Human-in-the-Loop) system** that pauses a tool call
 | **Audit Logging**           | `auditLogging: true` writes each request and decision, with the full tool arguments, to the NeuroLink logger; it is a log, not a compliance control                       | Debugging and your own review records      |
 
 ```typescript
-import { NeuroLink, type ConfirmationRequestEvent } from "@juspay/neurolink";
+import {
+  NeuroLink,
+  type ConfirmationRequestEvent,
+  type ConfirmationResponseEvent,
+} from "@juspay/neurolink";
 
 const neurolink = new NeuroLink({
   hitl: {
@@ -505,6 +510,7 @@ const neurolink = new NeuroLink({
 // Approval is event-based: NeuroLink emits a request, your app answers it
 const emitter = neurolink.getEventEmitter();
 emitter.on("hitl:confirmation-request", async (event) => {
+  const receivedAt = Date.now();
   // The emitter types listener arguments as unknown, so narrow the event
   const { payload } = event as ConfirmationRequestEvent;
   const { confirmationId, toolName, arguments: args } = payload;
@@ -517,8 +523,12 @@ emitter.on("hitl:confirmation-request", async (event) => {
       confirmationId,
       approved,
       reason: approved ? undefined : "Rejected by reviewer",
+      metadata: {
+        timestamp: new Date().toISOString(),
+        responseTime: Date.now() - receivedAt, // ms since the request arrived
+      },
     },
-  });
+  } satisfies ConfirmationResponseEvent);
 });
 
 // A tool call to a matching tool pauses until your handler answers

@@ -1167,6 +1167,9 @@ export type RequestAttemptLogEntry = {
   responseTimeMs: number;
   /** Time spent in this specific account attempt. */
   attemptDurationMs?: number;
+  /** Time this attempt waited on the shared transport-recovery gate before
+   *  dispatch. Not part of `attemptDurationMs`; omitted when zero. */
+  transportWaitMs?: number;
   errorType?: string;
   errorMessage?: string;
   /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
@@ -1306,6 +1309,10 @@ export type CodexRotationFailure = {
   lastErrorStatus: number;
   lastErrorCode: string | undefined;
   lastErrorMessage: string;
+  /** The upstream refused the request itself (a policy or invalid-request
+   *  code), not the account: no other account would answer differently, so the
+   *  pool ends the request here instead of rotating. */
+  refusedRequest?: boolean;
 };
 
 /** Minimal persistence contract needed by Codex rotating-token refreshes. */
@@ -2439,6 +2446,10 @@ export type ProxyFetchOptions = {
    * the request falls back to a direct connection, as it always has.
    */
   strict?: boolean;
+/** Transport deadlines for a proxied upstream request. */
+export type ProxyTimeouts = {
+  headersTimeout?: number;
+  bodyTimeout?: number;
 };
 
 // =============================================================================
@@ -2924,6 +2935,8 @@ export type CodexStreamEvidence = {
   terminalBytes: number;
   /** Malformed, oversized or undispatched frames prevent proving output absence. */
   observationIncomplete?: boolean;
+  /** Output items past the recorded-size cap were left out of `response.output`. */
+  outputItemsOmitted?: boolean;
   firstUsefulOutputAt?: number;
   firstUsefulOutputEvent?: string;
   errorType?: string;
@@ -4212,7 +4225,10 @@ export type OpenAIErrorResponse = {
 
 /** Parsed OpenAI request — intermediate form for NeuroLink pipeline. */
 /** One part of a Gemini `contents[].parts[]` entry. */
-export type ProxyGeminiPart = { text?: string; inlineData?: { data?: string } };
+export type ProxyGeminiPart = {
+  text?: string;
+  inlineData?: { mimeType?: string; data?: string };
+};
 
 /** One turn in a Gemini `contents[]` array. */
 export type ProxyGeminiContent = { role?: string; parts?: ProxyGeminiPart[] };

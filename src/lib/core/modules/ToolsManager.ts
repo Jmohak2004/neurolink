@@ -21,6 +21,7 @@ import { logger } from "../../utils/logger.js";
 import { TOOL_EVENTS_WRAPPED } from "../../types/index.js";
 import { getKeyCount } from "../../utils/transformationUtils.js";
 import { extractIsErrorText } from "../../utils/toolResultStatus.js";
+import { createToolExecutionId } from "../../utils/toolExecutionId.js";
 import { convertJsonSchemaToZod } from "../../utils/schemaConversion.js";
 import {
   generateToolOutputPreview,
@@ -666,6 +667,12 @@ export class ToolsManager {
         typeof toolCallId === "string" && toolCallId.length > 0
           ? { toolCallId }
           : {};
+      // Same per-invocation id executeTool gives registered tools, so a
+      // listener can pair this start with its end.
+      const eventIds = {
+        ...idField,
+        executionId: createToolExecutionId(toolName),
+      };
       return withSpan(
         {
           name: toolSpanName(toolName),
@@ -677,7 +684,7 @@ export class ToolsManager {
           const startTime = Date.now();
           this.emitToolEvent("tool:start", toolName, {
             input: params,
-            ...idField,
+            ...eventIds,
           });
 
           let result: unknown;
@@ -690,7 +697,7 @@ export class ToolsManager {
               error: errorMsg,
               success: false,
               responseTime: Date.now() - startTime,
-              ...idField,
+              ...eventIds,
             });
             throw error;
           }
@@ -706,7 +713,7 @@ export class ToolsManager {
             success: isErrorText === undefined,
             ...(isErrorText !== undefined ? { error: isErrorText } : {}),
             responseTime: Date.now() - startTime,
-            ...idField,
+            ...eventIds,
           });
           return result;
         },
@@ -1142,6 +1149,9 @@ export class ToolsManager {
                 attributes: {
                   "tool.name": toolName,
                   "tool.type": "custom",
+                  // Pure wrapper around the `tool` observation of the same
+                  // call: it stays an OpenTelemetry span but is not exported.
+                  [ATTR.NL_INTERNAL]: true,
                 },
               },
             );

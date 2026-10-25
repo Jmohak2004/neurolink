@@ -6189,22 +6189,34 @@ async function runXorDecide(): Promise<void> {
     },
   );
 
-  // ── X10c: XOR has no question cap, so a large batch goes out ──
-  await xorCase("DECIDE xor: no question cap", async () => {
-    const questions = Object.fromEntries(
-      Array.from({ length: 300 }, (_, i) => [
-        `q${i}`,
-        {
-          type: "boolean" as const,
-          instructions: `Is statement ${i} true?`,
-        },
-      ]),
-    );
-    await withMocks([xorOkRoute], async ({ calls }) => {
-      await decideOne(await createXor(), { questions });
-      expectEq(calls.length, 1, "300 questions in one request");
-    });
-  });
+  // ── X10c: the gateway's 128-question cap: 128 go out, 129 are refused ──
+  await xorCase(
+    "DECIDE xor: 128 questions go out in one request, and 129 are refused before any",
+    async () => {
+      const questionsOf = (n: number) =>
+        Object.fromEntries(
+          Array.from({ length: n }, (_, i) => [
+            `q${i}`,
+            {
+              type: "boolean" as const,
+              instructions: `Is statement ${i} true?`,
+            },
+          ]),
+        );
+      await withMocks([xorOkRoute], async ({ calls }) => {
+        await decideOne(await createXor(), { questions: questionsOf(128) });
+        expectEq(calls.length, 1, "128 questions in one request");
+      });
+      await withMocks([xorOkRoute], async ({ calls }) => {
+        const failure = await captureDecisionFailure(async () =>
+          decideOne(await createXor(), { questions: questionsOf(129) }),
+        );
+        expectEq(failure.kind, "max_tokens_exceeded", "129 refused");
+        expect(failure.message.includes("at most 128"), "names the cap");
+        expectEq(calls.length, 0, "refused before any request");
+      });
+    },
+  );
 
   const XOR_FIXTURES = fileURLToPath(
     new URL("./fixtures/decide/xor/", import.meta.url),
@@ -6214,58 +6226,98 @@ async function runXorDecide(): Promise<void> {
     readFileSync(fixturePath(name));
   const asDataUrl = (mime: string, bytes: Buffer): string =>
     `data:${mime};base64,${bytes.toString("base64")}`;
-  type XorSentBody = { model?: string; images?: string[]; video?: string };
+  type XorSentBody = {
+    model?: string;
+    state?: unknown;
+    images?: string[];
+    video?: string;
+    audio?: { data?: string; format?: string };
+  };
+  // One second of 8-bit mono PCM: the header gives an exact length.
+  const wavOf = (seconds: number): Buffer => {
+    const rate = 8000;
+    const dataBytes = Math.round(seconds * rate);
+    const wav = Buffer.alloc(44 + dataBytes, 0x80);
+    wav.write("RIFF", 0, "latin1");
+    wav.writeUInt32LE(36 + dataBytes, 4);
+    wav.write("WAVEfmt ", 8, "latin1");
+    wav.writeUInt32LE(16, 16);
+    wav.writeUInt16LE(1, 20);
+    wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(rate, 24);
+    wav.writeUInt32LE(rate, 28);
+    wav.writeUInt16LE(1, 32);
+    wav.writeUInt16LE(8, 34);
+    wav.write("data", 36, "latin1");
+    wav.writeUInt32LE(dataBytes, 40);
+    return wav;
+  };
 
-  // ── X11: images go out as data URLs, whichever form they came in ──
+  // ── X11: one image goes out as a data URL, whichever form it came in ──
   await xorCase(
-    "DECIDE xor: images from a Buffer, a path and a data URL",
+    "DECIDE xor: an image from a Buffer, a path and a data URL",
     async () => {
       const png = fixtureBytes("red.png");
       const expected = asDataUrl("image/png", png);
-      await withMocks([xorOkRoute], async ({ calls }) => {
-        const result = await decideOne(await createXor(), {
-          images: [png, fixturePath("red.png"), expected],
+      for (const image of [png, fixturePath("red.png"), expected]) {
+        await withMocks([xorOkRoute], async ({ calls }) => {
+          const result = await decideOne(await createXor(), {
+            images: [image],
+          });
+          const body = calls[0].bodyJson as XorSentBody;
+          expectEq(body.images?.length, 1, "one image sent");
+          expectEq(body.images?.[0], expected, "every form encodes the same");
+          expect(!("video" in body), "no video field");
+          expect(!("audio" in body), "no audio field when none was given");
+          expectEq(result.mediaBytes, expected.length, "media bytes reported");
         });
-        const body = calls[0].bodyJson as XorSentBody;
-        expectEq(body.images?.length, 3, "three images sent");
-        expect(
-          body.images?.every((url) => url === expected) === true,
-          "every form encodes identically",
-        );
-        expect(!("video" in body), "no video field when none was given");
-        expectEq(
-          result.mediaBytes,
-          expected.length * 3,
-          "media bytes reported",
-        );
-      });
+      }
     },
   );
 
-  await xorCase("DECIDE xor: a video from a Buffer and a path", async () => {
-    const mp4 = fixtureBytes("red.mp4");
-    const expected = asDataUrl("video/mp4", mp4);
-    for (const video of [mp4, fixturePath("red.mp4")]) {
-      await withMocks([xorOkRoute], async ({ calls }) => {
-        await decideOne(await createXor(), { video });
-        const body = calls[0].bodyJson as XorSentBody;
-        expectEq(body.video, expected, "video sent as a data URL");
-        expect(!("images" in body), "no images field when none was given");
-      });
-    }
-  });
+  // XOR's gateway drops a video and the model answers without it, so the
+  // request is refused rather than answered blind.
+  await xorCase(
+    "DECIDE xor: a video from a Buffer or a path is refused before any request",
+    async () => {
+      for (const video of [fixtureBytes("red.mp4"), fixturePath("red.mp4")]) {
+        await withMocks([xorOkRoute], async ({ calls }) => {
+          const failure = await captureDecisionFailure(async () =>
+            decideOne(await createXor(), { video }),
+          );
+          expectEq(failure.kind, "invalid_request", "video refused");
+          expect(failure.message.includes("does not accept video"), "says why");
+          expectEq(calls.length, 0, "no request");
+        });
+      }
+    },
+  );
 
   await xorCase(
-    "DECIDE xor: images and a video together are sent unchanged",
+    "DECIDE xor: an image and an audio clip go out together, the clip as { data, format }",
     async () => {
+      const wav = wavOf(1);
       await withMocks([xorOkRoute], async ({ calls }) => {
-        await decideOne(await createXor(), {
+        const result = await decideOne(await createXor(), {
+          state: "",
           images: [fixtureBytes("red.png")],
-          video: fixtureBytes("blue.mp4"),
+          audio: wav,
         });
         const body = calls[0].bodyJson as XorSentBody;
         expectEq(body.images?.length, 1, "the image is sent");
-        expect(typeof body.video === "string", "the video is sent");
+        expectEq(body.audio?.format, "wav", "the clip's format");
+        expectEq(
+          body.audio?.data,
+          wav.toString("base64"),
+          "the clip's bytes, as base64 and not a data URL",
+        );
+        expectEq(body.state, "", "an empty state is kept");
+        expectEq(
+          result.mediaBytes,
+          asDataUrl("image/png", fixtureBytes("red.png")).length +
+            wav.toString("base64").length,
+          "media bytes count the image and the clip",
+        );
       });
     },
   );
@@ -6279,7 +6331,7 @@ async function runXorDecide(): Promise<void> {
       const big = join(dir, "big.png");
       writeFileSync(
         big,
-        Buffer.concat([png.subarray(0, 8), Buffer.alloc(9 * 1024 * 1024)]),
+        Buffer.concat([png.subarray(0, 8), Buffer.alloc(26 * 1024 * 1024)]),
       );
       const rows: Array<{
         label: string;
@@ -6287,9 +6339,9 @@ async function runXorDecide(): Promise<void> {
         includes: string;
       }> = [
         {
-          label: "nine images",
-          request: { images: Array.from({ length: 9 }, () => png) },
-          includes: "at most 8",
+          label: "two images",
+          request: { images: [png, png] },
+          includes: "at most 1",
         },
         {
           label: "a remote URL in any case",
@@ -6307,9 +6359,35 @@ async function runXorDecide(): Promise<void> {
           includes: "not a recognised image",
         },
         {
-          label: "image bytes as a video",
+          label: "a video of any kind",
           request: { video: png },
-          includes: "not a recognised video",
+          includes: "does not accept video",
+        },
+        {
+          label: "an M4A clip",
+          request: {
+            audio: Buffer.concat([
+              Buffer.from([0, 0, 0, 0x20]),
+              Buffer.from("ftypM4A ", "latin1"),
+              Buffer.alloc(24),
+            ]),
+          },
+          includes: "AAC or M4A",
+        },
+        {
+          label: "a WAV clip over 30 seconds",
+          request: { audio: wavOf(31) },
+          includes: "the model hears at most 30",
+        },
+        {
+          label: "bytes that are not audio",
+          request: { audio: Buffer.from("not audio at all") },
+          includes: "not a recognised audio format",
+        },
+        {
+          label: "an image data URL as audio",
+          request: { audio: "data:image/png;base64,AAAA" },
+          includes: "not base64 audio",
         },
         {
           label: "an empty Buffer",
@@ -6334,12 +6412,12 @@ async function runXorDecide(): Promise<void> {
         {
           label: "a file over the body limit",
           request: { images: [big] },
-          includes: "at most 8388608",
+          includes: "at most 25000000",
         },
         {
           label: "a body over the limit",
           request: {
-            images: [`data:image/png;base64,${"A".repeat(9 * 1024 * 1024)}`],
+            images: [`data:image/png;base64,${"A".repeat(26 * 1024 * 1024)}`],
           },
           includes: "The request is",
         },
@@ -6399,8 +6477,8 @@ async function runXorDecide(): Promise<void> {
                 failure.message.includes("perplexity-decider"),
               `${name}: names every provider that reads images`,
             );
-            // Perplexity reads images and not video, so a request with a video
-            // is pointed at the provider that does, and at no other.
+            // No provider reads video, so a video refusal points nowhere; XOR
+            // alone reads audio, so an audio refusal points at XOR alone.
             const withVideo = await captureDecisionFailure(() =>
               provider.decide!({
                 state: "short",
@@ -6410,9 +6488,23 @@ async function runXorDecide(): Promise<void> {
             );
             expectEq(withVideo.kind, "invalid_request", `${name}: video kind`);
             expect(
-              withVideo.message.includes("xor") &&
+              !withVideo.message.includes("xor") &&
                 !withVideo.message.includes("perplexity-decider"),
-              `${name}: a video refusal names only the provider that reads video`,
+              `${name}: a video refusal names no provider, since none reads video`,
+            );
+            const withAudio = await captureDecisionFailure(() =>
+              provider.decide!({
+                state: "short",
+                questions: { q: XOR_QUESTIONS.urgent },
+                audio: wavOf(1),
+              }),
+            );
+            expectEq(withAudio.kind, "invalid_request", `${name}: audio kind`);
+            expect(
+              withAudio.message.includes("does not accept audio") &&
+                withAudio.message.includes("xor") &&
+                !withAudio.message.includes("perplexity-decider"),
+              `${name}: an audio refusal names only the provider that reads audio`,
             );
           }
           expectEq(calls.length, 0, "no request from either");
@@ -6481,18 +6573,18 @@ async function runXorDecide(): Promise<void> {
               provider: "xor",
               state: "short",
               questions: { urgent: XOR_QUESTIONS.urgent },
-              images: [png, png],
+              images: [png],
             });
             const span = nl.getSpans().find((s) => s.type === "model.decision");
             const attrs = (span?.attributes ?? {}) as Record<string, unknown>;
             expectEq(
               attrs["decision.images.count"],
-              2,
+              1,
               "image count on the span",
             );
             expectEq(
               attrs["decision.media.bytes"],
-              asDataUrl("image/png", png).length * 2,
+              asDataUrl("image/png", png).length,
               "media bytes on the span",
             );
             expect(
@@ -10586,6 +10678,19 @@ async function runClefErrors(): Promise<void> {
       ],
     },
     {
+      label:
+        "413 past the context window: the hint says the images are not counted",
+      reply: {
+        status: 413,
+        json: CLEF_ERRORS.overLength,
+        headers: { "cf-ai-req-id": "17060c92-1b60-48d5-b8ab-016882863c15" },
+      },
+      kind: "max_tokens_exceeded",
+      retryable: false,
+      includes: ["without its images"],
+      excludes: ["image data included"],
+    },
+    {
       label: "429 capacity exceeded",
       reply: { status: 429, json: CLEF_ERRORS.capacity, headers: modelHeaders },
       kind: "rate_limit",
@@ -11047,6 +11152,141 @@ async function runClefLimits(): Promise<void> {
     },
   );
 
+  // Cloudflare's own gate on the request text, measured 2026-10-23 and 24: 413/code
+  // 5021 when the characters of the JSON without its `images` array, over four,
+  // exceed twice the window its message prints (clef-flash 24,576, clef 65,536).
+  // The images are not counted, so a request is sized by its text alone: this is
+  // the text part of the body the provider sends.
+  const clefTextPartOf = (
+    model: string,
+    characters: number,
+  ): Partial<DecisionRequest> => {
+    const bare = JSON.stringify({
+      model: model
+        .trim()
+        .replace(/^@cf\/cloudflare\//i, "")
+        .toLowerCase(),
+      state: "short",
+      questions: { urgent: { type: "noul", instructions: "" } },
+    }).length;
+    return {
+      model,
+      questions: {
+        urgent: {
+          type: "boolean",
+          instructions: "q".repeat(characters - bare),
+        },
+      },
+    };
+  };
+  const sendClef = async (request: Partial<DecisionRequest>) =>
+    withMocks([clefRoute()], async ({ calls }) => {
+      const failure = await captureClefFailure(async () =>
+        clefDecideOne(await createClef(), request),
+      );
+      return { failure, calls: calls.length, bodyText: calls[0]?.bodyText };
+    });
+  const CLEF_FLASH_TEXT_LIMIT = 8 * 24_576 - 1_024;
+
+  await clefCase(
+    "DECIDE cloudflare-clef: clef-flash refuses a request text past 195,584 characters before sending it",
+    async () => {
+      const at = await sendClef(
+        clefTextPartOf("clef-flash", CLEF_FLASH_TEXT_LIMIT),
+      );
+      expect(!at.failure.threw, "a text of 195,584 characters is sent");
+      expectEq(at.calls, 1, "and reaches the network");
+      expectEq(
+        at.bodyText?.length,
+        CLEF_FLASH_TEXT_LIMIT,
+        "the helper builds the body the provider really sends",
+      );
+      const over = await sendClef(
+        clefTextPartOf("clef-flash", CLEF_FLASH_TEXT_LIMIT + 1),
+      );
+      expectEq(
+        over.failure.kind,
+        "max_tokens_exceeded",
+        "refused as Cloudflare's own 413 would be",
+      );
+      expect(
+        over.failure.message.includes('"clef-flash"') &&
+          over.failure.message.includes("accepts at most 195584") &&
+          over.failure.message.includes("without its images"),
+        `the message names the model, the limit and that images are not counted (got: ${over.failure.message})`,
+      );
+      expectEq(over.calls, 0, "nothing was sent");
+    },
+  );
+
+  await clefCase(
+    "DECIDE cloudflare-clef: the clef-flash text limit follows the model however it is spelled",
+    async () => {
+      for (const model of [
+        "@cf/cloudflare/clef-flash",
+        "CLEF-FLASH",
+        " clef-flash ",
+      ]) {
+        const over = await sendClef(
+          clefTextPartOf(model, CLEF_FLASH_TEXT_LIMIT + 1),
+        );
+        expectEq(
+          over.failure.kind,
+          "max_tokens_exceeded",
+          `"${model}" is held to the clef-flash limit`,
+        );
+        expectEq(over.calls, 0, `"${model}": nothing was sent`);
+      }
+    },
+  );
+
+  await clefCase(
+    "DECIDE cloudflare-clef: images are not counted, so clef-flash still sends a body past 196,608 bytes",
+    async () => {
+      const png = Buffer.concat([
+        syntheticPng(10, 10),
+        Buffer.alloc(150_000, 7),
+      ]);
+      const sent = await sendClef({
+        model: "clef-flash",
+        state: "",
+        images: [png],
+      });
+      expect(!sent.failure.threw, "a 150 KB image is sent");
+      expect(
+        (sent.bodyText?.length ?? 0) > 196_608,
+        `the body is past the text limit's 196,608 (got ${sent.bodyText?.length})`,
+      );
+    },
+  );
+
+  await clefCase(
+    "DECIDE cloudflare-clef: clef and a model NeuroLink does not know have no text limit of the flash kind",
+    async () => {
+      for (const model of ["clef", "clef-next"]) {
+        const sent = await sendClef(
+          clefTextPartOf(model, CLEF_FLASH_TEXT_LIMIT + 4_000),
+        );
+        expect(
+          !sent.failure.threw,
+          `${model}: a text past clef-flash's limit is sent`,
+        );
+        expectEq(sent.calls, 1, `${model}: and reaches the network`);
+      }
+    },
+  );
+
+  await clefCase(
+    "DECIDE cloudflare-clef: the manifest gives each model the window Cloudflare prints",
+    async () => {
+      const { getManifestForProvider } =
+        await import("../dist/models/manifestRegistry.js");
+      const models = getManifestForProvider("cloudflare-clef")?.models;
+      expectEq(models?.["clef-flash"]?.contextWindow, 24_576, "clef-flash");
+      expectEq(models?.clef?.contextWindow, 65_536, "clef");
+    },
+  );
+
   // The case batching exists for: relevance compaction asks about up to 300
   // messages, and Clef takes 64. decide() refuses that (above); tryDecide is what
   // every built-in consumer calls, and splits it.
@@ -11396,10 +11636,12 @@ async function runClefMediaHints(): Promise<void> {
     (d) => d.inferenceKinds?.includes("decide") && d.decisionLimits?.media,
   );
   const coveredVideo = new Set<boolean>();
+  const coveredAudio = new Set<boolean>();
   for (const descriptor of descriptors) {
     const limits = descriptor.decisionLimits!;
     const media = limits.media!;
     coveredVideo.add(media.video);
+    coveredAudio.add(media.audio !== undefined);
     await clefCase(
       "DECIDE media limits: request byte hint respects video for " +
         descriptor.name,
@@ -11445,6 +11687,11 @@ async function runClefMediaHints(): Promise<void> {
               media.video,
               "hint follows media.video",
             );
+            expectEq(
+              failure.message.includes("a shorter audio clip"),
+              media.audio !== undefined,
+              "hint follows media.audio",
+            );
             expect(
               failure.message.includes("Send fewer or smaller images"),
               "image hint retained",
@@ -11459,10 +11706,13 @@ async function runClefMediaHints(): Promise<void> {
     );
   }
   await clefCase(
-    "DECIDE media limits: byte hints cover video and image-only providers",
+    "DECIDE media limits: byte hints cover image-only providers and one that also takes audio",
     async () => {
-      expect(coveredVideo.has(true), "loop covered a video provider");
+      // No shipped provider reads video, so its hint is covered by none here.
+      expect(!coveredVideo.has(true), "a provider declares video again");
       expect(coveredVideo.has(false), "loop covered an image-only provider");
+      expect(coveredAudio.has(true), "loop covered an audio provider");
+      expect(coveredAudio.has(false), "loop covered a provider without audio");
     },
   );
   await clefCase(
@@ -15475,6 +15725,178 @@ async function runScaleDownDecide(): Promise<void> {
     }
 
     await scaledownCase(
+      "DECIDE scaledown: a 402 keeps its kind and its text, and adds that ScaleDown also answers 402 for a key it does not recognise, naming the variable",
+      async () => {
+        resetScaleDownEnv();
+        await withMocks(
+          [
+            scaledownRoute({
+              status: 402,
+              json: { detail: `Insufficient credits (sent ${key})` },
+            }),
+          ],
+          async ({ calls }) => {
+            const failure = await capturePerplexityFailure(async () =>
+              ask(fresh()),
+            );
+            expectEq(failure.kind, "invalid_request", "the kind is kept");
+            expectEq(failure.status, 402, "the status is kept");
+            expectEq(failure.retryable, false, "not retried");
+            expect(
+              failure.message.includes("Insufficient credits"),
+              "ScaleDown's own text comes first",
+            );
+            expect(
+              failure.message.includes("does not recognise the API key"),
+              "a 402 can also mean an unrecognised key",
+            );
+            expect(
+              failure.message.includes(keyEnv),
+              "the variable to check is named",
+            );
+            expect(!failure.message.includes(key), "the key is not repeated");
+            expectEq(posts(calls).length, 1, "requests sent");
+          },
+        );
+        for (const status of [401, 422, 429, 502]) {
+          await withMocks(
+            [scaledownRoute({ status, json: { detail: "stand-in" } })],
+            async () => {
+              const failure = await capturePerplexityFailure(async () =>
+                ask(fresh()),
+              );
+              expect(
+                !failure.message.includes(keyEnv) &&
+                  !failure.message.includes("does not recognise"),
+                `HTTP ${status} carries no 402 note`,
+              );
+            },
+          );
+        }
+      },
+    );
+
+    // ScaleDown's own 422 bodies, recorded in a live test on 20 Oct 2026: the
+    // reason is in `detail` as a list, and each item echoes the request.
+    const recordedUnknownModel = {
+      detail: [
+        {
+          type: "value_error",
+          loc: ["body"],
+          msg: "Value error, Unsupported model 'classify-2'. Supported: classify, classify-1.",
+          input: {
+            model: "classify-2",
+            state: "We were billed twice for March. Please refund it today.",
+            questions: {
+              team: { type: "choice", instructions: "Which team?" },
+            },
+          },
+          ctx: { error: {} },
+        },
+      ],
+    };
+    const elevenLevels = Array.from({ length: 11 }, (_, i) => `level ${i + 1}`);
+    const recordedElevenLevels = {
+      detail: [
+        {
+          type: "literal_error",
+          loc: ["body", "questions", "sev", "ChoiceQuestion", "type"],
+          msg: "Input should be 'choice'",
+          input: "score",
+          ctx: { expected: "'choice'" },
+        },
+        {
+          type: "dict_type",
+          loc: ["body", "questions", "sev", "ChoiceQuestion", "criteria"],
+          msg: "Input should be a valid dictionary",
+          input: elevenLevels,
+        },
+        {
+          type: "literal_error",
+          loc: ["body", "questions", "sev", "NoulQuestion", "type"],
+          msg: "Input should be 'noul'",
+          input: "score",
+          ctx: { expected: "'noul'" },
+        },
+        {
+          type: "value_error",
+          loc: [
+            "body",
+            "questions",
+            "sev",
+            "function-after[require_criteria_range(), ScoreQuestion]",
+          ],
+          msg: "Value error, 'criteria' must have between 2 and 10 levels, got 11",
+          input: {
+            type: "score",
+            instructions: "How severe?",
+            criteria: elevenLevels,
+          },
+          ctx: { error: {} },
+        },
+      ],
+    };
+    for (const row of [
+      {
+        name: "an unknown model",
+        body: recordedUnknownModel,
+        reason:
+          "Unsupported model 'classify-2'. Supported: classify, classify-1.",
+        echoed: ["We were billed twice", "Which team?"],
+      },
+      {
+        name: "a score question with 11 levels",
+        body: recordedElevenLevels,
+        reason: "'criteria' must have between 2 and 10 levels, got 11",
+        echoed: ["level 1", "level 11", "How severe?"],
+      },
+    ]) {
+      await scaledownCase(
+        `DECIDE scaledown: a 422 for ${row.name} shows ScaleDown's reason from the detail list and none of the request it echoes`,
+        async () => {
+          resetScaleDownEnv();
+          await withMocks(
+            [scaledownRoute({ status: 422, json: row.body })],
+            async ({ calls }) => {
+              const failure = await capturePerplexityFailure(async () =>
+                ask(fresh()),
+              );
+              expectEq(failure.kind, "invalid_request", "the kind is kept");
+              expectEq(failure.status, 422, "the status is kept");
+              expectEq(failure.retryable, false, "not retried");
+              expect(
+                failure.message.includes(row.reason),
+                `the reason is in the message: ${failure.message}`,
+              );
+              for (const echoed of row.echoed) {
+                expect(
+                  !failure.message.includes(echoed),
+                  `the echoed request text "${echoed}" is not repeated`,
+                );
+              }
+              expectEq(posts(calls).length, 1, "requests sent");
+            },
+          );
+        },
+      );
+    }
+
+    await scaledownCase(
+      "DECIDE scaledown: the entry declares its own 30,000 ms decide timeout",
+      async () => {
+        const { PROVIDER_DESCRIPTORS_BY_NAME } =
+          await import("../dist/factories/providerDescriptors.js");
+        expectEq(
+          [...PROVIDER_DESCRIPTORS_BY_NAME.values()].find(
+            (d) => d.name === provider,
+          )?.timeouts?.decideMs,
+          30_000,
+          "the declared decide timeout",
+        );
+      },
+    );
+
+    await scaledownCase(
       "DECIDE scaledown: a 502 or a 429 followed by a good reply is retried into an answer, with the same x-api-key",
       async () => {
         for (const status of [502, 429]) {
@@ -15607,6 +16029,176 @@ async function runScaleDownDecide(): Promise<void> {
   }
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Section: a decision does not load the model registry
+// ───────────────────────────────────────────────────────────────────────
+
+/**
+ * For a provider created with no model named, the factory loads a model
+ * registry to look up a default: http://localhost:3001, then
+ * raw.githubusercontent.com, then ./config/models.json. The registry lists
+ * chat providers only, and a decision-only provider reads its own model
+ * setting, so a decision has no use for it. Every `decide()` call that named
+ * no model nevertheless made a HEAD and a GET to the local port and a GET to
+ * GitHub before it reached the provider. Every request here is fetch-mocked.
+ */
+const MODEL_REGISTRY_HOSTS = ["localhost:3001", "raw.githubusercontent.com"];
+
+const registryRequests = (
+  calls: ReturnType<typeof installMockFetch>["calls"],
+) =>
+  calls.filter((call) => MODEL_REGISTRY_HOSTS.includes(new URL(call.url).host));
+
+/**
+ * The registry is not asked for again for five minutes once it has loaded, and
+ * an earlier section may have loaded it from ./config/models.json, the last of
+ * its sources. Rewinding the clock makes the next factory call due, as the
+ * first call of a fresh process is.
+ */
+async function makeModelRegistryDue(): Promise<void> {
+  const { dynamicModelProvider } = await import("../dist/index.js");
+  (dynamicModelProvider as unknown as { lastFetch: number }).lastFetch = 0;
+  expect(
+    dynamicModelProvider.needsRefresh(),
+    "the registry is due for a refresh",
+  );
+}
+
+async function runDecideRegistryLookups(): Promise<void> {
+  const { NeuroLink, AIProviderFactory, DECISION_PROVIDERS } =
+    await import("../dist/index.js");
+  const registryCase = perplexityCase;
+  const ambient = [
+    "MODEL_CONFIG_URL",
+    "MODEL_CONFIG_GITHUB_REPO",
+    "MODEL_CONFIG_GITHUB_BRANCH",
+    "OPENAI_MODEL",
+  ].map((name) => [name, process.env[name]] as const);
+  // The registry's sources are read from the first three when it loads: the
+  // hosts below are the defaults. OPENAI_MODEL names the chat provider's model
+  // before the registry is consulted, so a developer's .env would hide the
+  // positive control's request.
+  ambient.forEach(([name]) => setEnv(name, undefined));
+
+  try {
+    await registryCase(
+      "DECIDE registry: a decision that names no model makes no request but the decision itself, answers as before and is priced as before",
+      async () => {
+        resetScaleDownEnv();
+        await makeModelRegistryDue();
+        await withMocks([scaledownRoute()], async ({ calls }) => {
+          const nl = new NeuroLink({ conversationMemory: { enabled: false } });
+          const result = await nl.decide({
+            provider: SCALEDOWN_SPEC.provider,
+            state: "short",
+            questions: SCALEDOWN_QUESTIONS,
+          });
+          expectEq(
+            registryRequests(calls).length,
+            0,
+            `requests to ${MODEL_REGISTRY_HOSTS.join(" or ")}`,
+          );
+          expectEq(
+            calls.map((call) => call.url).join(","),
+            SCALEDOWN_SPEC.endpoint,
+            "the only request is the decision",
+          );
+          expectEq(result.model, SCALEDOWN_SPEC.model, "the model");
+          expect(
+            sameJson(result.answers, SCALEDOWN_EXPECTED_ANSWERS),
+            "the answers are the reply's",
+          );
+          const cost = nl
+            .getSpans()
+            .find((span) => span.type === "model.decision")?.attributes[
+            "ai.cost.total"
+          ];
+          expect(
+            typeof cost === "number" &&
+              Math.abs(cost - (120 * 0.05) / 1_000_000) < 1e-15,
+            `120 input tokens cost 120 x 0.05 / 1e6, got ${String(cost)}`,
+          );
+        });
+      },
+    );
+
+    await registryCase(
+      "DECIDE registry: no decision provider, by id or by alias, asks for the registry when the factory creates it with no model",
+      async () => {
+        resetScaleDownEnv();
+        const names = DECISION_PROVIDERS.flatMap((descriptor) => [
+          String(descriptor.name),
+          ...descriptor.aliases,
+        ]);
+        // Positive control for the loop: the eight providers and their aliases
+        // (jev, scaledown-classify, ...), so an emptied list fails here.
+        expect(
+          names.length >= 8 &&
+            ["typesafe", "jev", "scaledown", "scaledown-classify"].every(
+              (name) => names.includes(name),
+            ),
+          `the loop covers every decision provider and alias, got ${names.join(",")}`,
+        );
+        for (const name of names) {
+          await makeModelRegistryDue();
+          await withMocks([], async ({ calls }) => {
+            // Most are not configured here, so creation may fail; the registry
+            // is asked for, if at all, before that.
+            await AIProviderFactory.createProvider(
+              name,
+              undefined,
+              false,
+            ).catch(() => undefined);
+            expectEq(
+              registryRequests(calls).length,
+              0,
+              `${name}: requests to ${MODEL_REGISTRY_HOSTS.join(" or ")}`,
+            );
+          });
+        }
+      },
+    );
+
+    await registryCase(
+      "DECIDE registry: positive control, a chat provider created with no model still asks for the registry, the local port first and GitHub next",
+      async () => {
+        setEnv("OPENAI_API_KEY", "test-fake-openai-credential");
+        await makeModelRegistryDue();
+        await withMocks([], async ({ calls }) => {
+          await AIProviderFactory.createProvider(
+            "openai",
+            undefined,
+            false,
+          ).catch(() => undefined);
+          expectEq(
+            registryRequests(calls)
+              .map((call) => `${call.method} ${call.url}`)
+              .join(","),
+            "HEAD http://localhost:3001/health,GET http://localhost:3001/api/v1/models,GET https://raw.githubusercontent.com/juspay/neurolink/release/config/models.json",
+            "the registry requests of a chat provider",
+          );
+        });
+        await makeModelRegistryDue();
+        await withMocks([], async ({ calls }) => {
+          await AIProviderFactory.createProvider(
+            "openai",
+            "gpt-4o-mini",
+            false,
+          ).catch(() => undefined);
+          expectEq(
+            registryRequests(calls).length,
+            0,
+            "a chat provider with a named model asks for nothing",
+          );
+        });
+      },
+    );
+  } finally {
+    ambient.forEach(([name, value]) => setEnv(name, value));
+    setEnv("OPENAI_API_KEY", undefined);
+  }
+}
+
 async function runDecideSection(): Promise<void> {
   console.log(
     "\n=== Decision providers (TypeSafe, Laya, XOR, SubQ, Perplexity, Cloudflare Clef, OpenAI Decisions, ScaleDown) ===",
@@ -15648,6 +16240,7 @@ async function runDecideSection(): Promise<void> {
     await runOpenAIDecisionsSurface();
     await runOpenAIDecisionsAmbientGuard();
     await runScaleDownDecide();
+    await runDecideRegistryLookups();
     await runDecideCatalogSection();
   } finally {
     sharedKeyEnv.forEach((name, i) => setEnv(name, ambient[i]));

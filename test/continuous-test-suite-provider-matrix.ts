@@ -28,9 +28,23 @@ import "dotenv/config";
 import { NeuroLink, AIProviderFactory } from "../dist/index.js";
 import {
   defineSuite,
+  HardFail,
+  log,
+  logSection,
   Skip,
-  isExpectedProviderError,
 } from "./helpers/harness.js";
+import {
+  LIVE_GATE_ALLOWLIST,
+  allowlistProblems,
+  coverageLines,
+  coverageOf,
+  floorEnforced,
+  floorProblem,
+  isExpectedLive,
+  noteQuietSkip,
+  recordCell,
+  settleCell,
+} from "./helpers/liveGate.js";
 import { PROVIDERS, hasProviderEnv } from "./helpers/providerMatrix.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
@@ -67,13 +81,20 @@ if (targets.length === 0) {
 // HELPERS
 // ============================================================
 
-/** Promote known credential/network errors to SKIP. */
-function skipIfProviderError(err: unknown): never {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (isExpectedProviderError(msg)) {
-    throw new Skip(`provider unavailable — ${msg.slice(0, 100)}`);
-  }
-  throw err as Error;
+/**
+ * One cell of the matrix. The body's own catch hands its error to `settleCell`,
+ * which decides what it means (see test/helpers/liveGate.ts) and records it;
+ * a body that returns has passed.
+ */
+function cell(
+  providerName: string,
+  label: string,
+  body: () => Promise<void>,
+): Promise<void> {
+  return test(label, async () => {
+    await body();
+    recordCell(providerName, "passed");
+  });
 }
 
 function delay(ms: number): Promise<void> {
@@ -85,13 +106,34 @@ function delay(ms: number): Promise<void> {
 // ============================================================
 
 async function runMatrix(): Promise<void> {
+  // A bad allowlist (a typo, an entry meant to last a quarter) would otherwise
+  // excuse a broken provider for as long as nobody looked, so it is a failure.
+  await test("live gate: the allowlist is well formed", () => {
+    const problems = allowlistProblems(LIVE_GATE_ALLOWLIST);
+    if (problems.length > 0) {
+      throw new HardFail(
+        `the live-gate allowlist is invalid: ${problems.join("; ")}`,
+      );
+    }
+  });
+
   for (const p of targets) {
+    // A provider with no secret and no recorded live run has nothing to prove.
+    // It is named once and never called, so the SDK does not log an ERROR for
+    // the credential it was never given.
+    if (!isExpectedLive(p.name)) {
+      noteQuietSkip(p.name);
+      await test(`[${p.name}] not run: no secret and no live evidence`, () => {
+        throw new Skip(`set ${p.envVars[0]} to run it`);
+      });
+      continue;
+    }
     const sdk = new NeuroLink();
     const baseOpts = { provider: p.name, model: p.defaultModel };
 
     // ---------- text + streaming ----------
     if (p.text) {
-      await test(`[${p.name}] generate basic text`, async () => {
+      await cell(p.name, `[${p.name}] generate basic text`, async () => {
         try {
           let lastContent: string | undefined;
           for (let attempt = 1; attempt <= 2; attempt++) {
@@ -112,13 +154,13 @@ async function runMatrix(): Promise<void> {
           }
           throw new Error("empty response");
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     if (p.streaming) {
-      await test(`[${p.name}] stream tokens`, async () => {
+      await cell(p.name, `[${p.name}] stream tokens`, async () => {
         try {
           let totalCount = 0;
           for (let attempt = 1; attempt <= 2; attempt++) {
@@ -152,14 +194,14 @@ async function runMatrix(): Promise<void> {
             );
           }
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     // ---------- tool calling ----------
     if (p.tools) {
-      await test(`[${p.name}] tool calling`, async () => {
+      await cell(p.name, `[${p.name}] tool calling`, async () => {
         try {
           const sdkWithTool = new NeuroLink();
           sdkWithTool.registerTool("getTime", {
@@ -210,14 +252,14 @@ async function runMatrix(): Promise<void> {
           }
           await sdkWithTool.shutdown?.();
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     // ---------- structured output ----------
     if (p.structuredOutput) {
-      await test(`[${p.name}] structured output`, async () => {
+      await cell(p.name, `[${p.name}] structured output`, async () => {
         try {
           const zod = await import("zod").catch(() => null);
           if (!zod) {
@@ -302,14 +344,14 @@ async function runMatrix(): Promise<void> {
             );
           }
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     // ---------- thinking levels ----------
     if (p.thinking) {
-      await test(`[${p.name}] thinking level: high`, async () => {
+      await cell(p.name, `[${p.name}] thinking level: high`, async () => {
         try {
           const r = await sdk.generate({
             ...baseOpts,
@@ -322,14 +364,14 @@ async function runMatrix(): Promise<void> {
             throw new Error("empty response");
           }
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     // ---------- vision ----------
     if (p.vision) {
-      await test(`[${p.name}] vision describes an image`, async () => {
+      await cell(p.name, `[${p.name}] vision describes an image`, async () => {
         try {
           const r = (await sdk.generate({
             provider: p.name,
@@ -350,14 +392,14 @@ async function runMatrix(): Promise<void> {
             throw new Error("response does not describe the fixture image");
           }
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     // ---------- embeddings ----------
     if (p.embeddings) {
-      await test(`[${p.name}] embed single text`, async () => {
+      await cell(p.name, `[${p.name}] embed single text`, async () => {
         try {
           // Embeddings live on the provider (BaseProvider.embed) rather than
           // on the NeuroLink class. Resolve the provider directly and call
@@ -379,12 +421,26 @@ async function runMatrix(): Promise<void> {
             throw new Error("empty embedding vector");
           }
         } catch (err) {
-          skipIfProviderError(err);
+          settleCell(p.name, err);
         }
       });
     }
 
     await sdk.shutdown?.().catch(() => {});
+  }
+
+  logSection("Live gate coverage");
+  const coverage = coverageOf(targets.map((target) => target.name));
+  for (const line of coverageLines(coverage)) {
+    log(`  ${line}`, "blue");
+  }
+  if (floorEnforced()) {
+    await test("live gate: enough providers passed", () => {
+      const problem = floorProblem(coverage);
+      if (problem !== undefined) {
+        throw new HardFail(problem);
+      }
+    });
   }
 }
 

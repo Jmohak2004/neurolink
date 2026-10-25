@@ -8,14 +8,15 @@
  * `@google/genai` are imported dynamically so the core package does not require
  * them unless the realtime agent is used.
  *
- * The xai backend has only been exercised against a stub WebSocket server. It
- * has never talked to the real xAI service.
+ * The xai backend was run against the real xAI service on 2026-10-20; what that
+ * showed, and what is still unmeasured, is in the document below.
  *
  * See docs/features/livekit-voice-agent.md.
  */
 
 import type { RealtimeLlm, RealtimeVoiceConfig } from "../../types/index.js";
-import { requireNoCleartextCrossHost } from "./config.js";
+import { requireWebSocketUrl } from "./config.js";
+import { observeXaiSession } from "./xaiSessionWatch.js";
 
 /**
  * Fail early, naming the variable, when `XAI_API_KEY` is blank or absent.
@@ -71,9 +72,11 @@ async function createXaiRealtimeLlm(
 ): Promise<RealtimeLlm> {
   requireXaiApiKey();
   // `cfg` can be built by hand, without `resolveRealtimeVoiceConfig`, so the
-  // key-leak check runs here as well as there.
+  // whole base URL check runs here as well as there: the ws or wss shape, and
+  // the cross-host rule that keeps XAI_API_KEY off an unencrypted link. The
+  // cross-host rule alone lets an http(s) or unparseable value reach the plugin.
   if (cfg.xaiBaseURL) {
-    requireNoCleartextCrossHost(cfg.xaiBaseURL, "xaiBaseURL");
+    requireWebSocketUrl(cfg.xaiBaseURL, "xaiBaseURL");
   }
   const xai = await import("@livekit/agents-plugin-xai");
 
@@ -81,18 +84,37 @@ async function createXaiRealtimeLlm(
   // own defaults, so a key holding `undefined` would erase the default: a
   // missing `baseURL` would send the xAI key to OPENAI_BASE_URL or
   // api.openai.com, and no `apiKey` option is passed at all because the plugin
-  // reads XAI_API_KEY itself. The plugin forwards `baseURL` although its
-  // declared option type leaves it out.
+  // reads XAI_API_KEY itself. The plugin forwards `baseURL` and
+  // `inputAudioTranscription` although its declared option type leaves them out.
+  //
+  // `inputAudioTranscription` is the one key set to `undefined` on purpose, to
+  // erase the plugin's OpenAI default of `gpt-4o-mini-transcribe`. With it xAI
+  // answered one spoken utterance with five "completed" transcripts, which the
+  // turn recorder stored as one user message with the utterance repeated;
+  // without it xAI sends one. `undefined`, unlike `null`, keeps the plugin's
+  // user-transcription capability on, and JSON.stringify leaves the key out of
+  // the `session.update` it sends.
   const modelOptions: NonNullable<
     ConstructorParameters<typeof xai.realtime.RealtimeModel>[0]
-  > & { baseURL?: string } = { model: cfg.model };
+  > & { baseURL?: string; inputAudioTranscription?: undefined } = {
+    model: cfg.model,
+    inputAudioTranscription: undefined,
+  };
   if (cfg.voice) {
     modelOptions.voice = cfg.voice;
   }
   if (cfg.xaiBaseURL) {
     modelOptions.baseURL = cfg.xaiBaseURL;
   }
-  return new xai.realtime.RealtimeModel(modelOptions);
+
+  class ObservedXaiRealtimeModel extends xai.realtime.RealtimeModel {
+    session() {
+      const session = super.session();
+      observeXaiSession(session, cfg.model);
+      return session;
+    }
+  }
+  return new ObservedXaiRealtimeModel(modelOptions);
 }
 
 /**
@@ -101,9 +123,12 @@ async function createXaiRealtimeLlm(
  * The gemini branch builds exactly what the agent has always built: Vertex AI,
  * the configured model, transcripts of both sides, and project, location,
  * voice and modality when set. The xai branch needs `XAI_API_KEY` in the
- * environment and throws before touching the plugin when it is missing. It also
- * throws before touching the plugin for a `ws://` base URL to a host other than
- * loopback, unless `XAI_REALTIME_ALLOW_INSECURE=true`, as config resolution does.
+ * environment and throws before touching the plugin when it is missing. It then
+ * checks `xaiBaseURL` as config resolution does, and throws before touching the
+ * plugin for a value that is not a `ws://` or `wss://` URL, and for a `ws://`
+ * URL to a host other than localhost, 127.0.0.0/8 or [::1] unless
+ * `XAI_REALTIME_ALLOW_INSECURE=true`. That opt-in never admits a value that is
+ * not a ws or wss URL. The errors name `xaiBaseURL` and do not repeat the value.
  */
 export async function createRealtimeLlm(
   cfg: RealtimeVoiceConfig,

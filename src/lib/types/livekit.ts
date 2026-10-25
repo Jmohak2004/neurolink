@@ -10,6 +10,7 @@
  * See docs/features/livekit-voice-agent.md.
  */
 
+import type { EventEmitter } from "node:events";
 import type { NeuroLinkEvents, TypedEventEmitter } from "./common.js";
 import type { StreamOptions, StreamResult } from "./stream.js";
 import type {
@@ -484,6 +485,26 @@ export type RealtimeLlm = {
 };
 
 /**
+ * A session of the xAI plugin as far as the xai model's watcher needs it: an
+ * event emitter (the plugin republishes every server event as
+ * `openai_server_event_received`) that can be closed.
+ */
+export type XaiObservedSession = EventEmitter & {
+  close: () => Promise<void>;
+};
+
+/**
+ * Token counts of one xAI response. xAI sends them at the top level of
+ * `response.done`; the plugin reads `response.usage`, which xAI leaves empty.
+ */
+export type XaiResponseUsage = {
+  inputTokens: number;
+  inputAudioTokens: number;
+  outputTokens: number;
+  outputAudioTokens: number;
+};
+
+/**
  * Realtime voice configuration resolved from the environment.
  *
  * In speech-to-speech mode one realtime model (Gemini Live on Vertex, or xAI
@@ -668,10 +689,15 @@ export type VoiceTurnRecorder = {
    * Call it once, when the agent is about to speak its greeting.
    */
   expectGreeting: () => void;
-  /** A tool call started in the current exchange. */
-  toolStart: (call: { name: string; args?: unknown }) => void;
+  /** A tool call started in the current exchange. `callId` pairs it with its end when calls overlap. */
+  toolStart: (call: { name: string; args?: unknown; callId?: string }) => void;
   /** A tool call finished in the current exchange. */
-  toolEnd: (call: { name: string; result?: unknown; error?: string }) => void;
+  toolEnd: (call: {
+    name: string;
+    result?: unknown;
+    error?: string;
+    callId?: string;
+  }) => void;
   /**
    * Shutdown: close what is open, then wait for pending writes — but no longer
    * than `budgetMs`. Safe to call more than once.
@@ -679,6 +705,16 @@ export type VoiceTurnRecorder = {
   flush: (budgetMs: number) => Promise<VoiceTurnRecorderStats>;
   /** Counters, for logs and tests. */
   stats: () => VoiceTurnRecorderStats;
+};
+
+/** Who and what a realtime turn is traced as; `userId` is set only for a verified binding. */
+export type RealtimeTracedCall = {
+  sessionId?: string;
+  userId?: string;
+  roomName?: string;
+  model?: string;
+  /** The provider of the realtime backend (`vertex` for Gemini Live, `xai` for Grok Voice); `vertex` when absent. */
+  provider?: string;
 };
 
 /** What a realtime call needs from its memory once its binding verified. */
@@ -707,6 +743,8 @@ export type VoiceTurnRecorderStats = {
 export type VoiceTurnRecorderOptions = {
   /** Stores one exchange. Throwing means "not stored"; the recorder retries. */
   write: (record: VoiceTurnRecord) => Promise<void>;
+  /** An exchange closed: called once per exchange, in order, before its write is queued, so it never waits behind earlier writes. */
+  onClosed?: (record: VoiceTurnRecord) => void;
   /** A write succeeded. */
   onRecorded?: (record: VoiceTurnRecord) => void;
   /** A write failed after every retry. The call continues. */
@@ -841,7 +879,16 @@ export type BuildRealtimeMcpToolsParams = {
    */
   toolTimeoutMs?: number;
   /** Observes a tool call as it starts. A throwing observer never affects the call. */
-  onToolStart?: (call: { name: string; args: Record<string, unknown> }) => void;
+  onToolStart?: (call: {
+    name: string;
+    args: Record<string, unknown>;
+    callId?: string;
+  }) => void;
   /** Observes a tool call as it ends, with its result as text or its error. */
-  onToolEnd?: (call: { name: string; result?: string; error?: string }) => void;
+  onToolEnd?: (call: {
+    name: string;
+    result?: string;
+    error?: string;
+    callId?: string;
+  }) => void;
 };

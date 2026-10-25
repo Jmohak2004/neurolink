@@ -2061,8 +2061,22 @@ export type NativeGenerateLoopArgs = {
   conversation: Array<Record<string, unknown>>;
   /** Tool declarations in the v3 shape doGenerate already knows how to convert. */
   tools?: Array<Record<string, unknown>>;
-  /** Registered tools, used to execute a call the model asks for. */
-  toolsRecord: Record<string, unknown>;
+  /**
+   * Registered tools, used to execute a call the model asks for. Typed
+   * `Record<string, Tool>`; it was `Record<string, unknown>` before discovery
+   * learned to declare tools that join it mid-turn, so a caller that builds
+   * this record from loosely typed tools now needs a cast to `Tool`.
+   */
+  toolsRecord: Record<string, Tool>;
+  /**
+   * Builds the declaration for a tool that joined `toolsRecord` mid-turn
+   * (discovery's search_tools loads tools into it). Optional: by default the
+   * loop declares such a tool in the provider-neutral shape every provider's
+   * `doGenerate` converts (`toNativeToolDeclaration`), for every provider that
+   * runs this loop. Set it only to declare in another shape. The loop appends
+   * the declarations to `tools` in place.
+   */
+  declareTool?: (name: string, tool: Tool) => Record<string, unknown>;
   /** The turn's resolved tool choice, applied per step via `resolveStepToolChoice`. */
   toolChoice?: unknown;
   /** Leading steps a forced `toolChoice` stays in force (default 1). */

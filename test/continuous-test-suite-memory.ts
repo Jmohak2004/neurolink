@@ -31,6 +31,7 @@ import { NeuroLink } from "../dist/index.js";
 import type { ChatMessage } from "../src/lib/types/index.js";
 
 import { assertDistFresh } from "./helpers/distFreshness.js";
+import { isExpectedProviderError } from "./helpers/envGuard.js";
 
 // Fail loudly rather than silently testing a stale build (see distFreshness.ts).
 assertDistFresh();
@@ -208,24 +209,6 @@ function validateResponseContent(
       `Matched: ${found.join(", ") || "none"}`,
     ],
   };
-}
-
-function isExpectedProviderError(msg: string): boolean {
-  const lower = msg.toLowerCase();
-  return [
-    "api key",
-    "authentication",
-    "rate limit",
-    "quota",
-    "credentials",
-    "could not be resolved",
-    "ollama",
-    "provider",
-    "failed to generate",
-    "cannot connect",
-    "econnrefused",
-    "provider error",
-  ].some((p) => lower.includes(p));
 }
 
 async function globalCleanup(): Promise<void> {
@@ -1115,11 +1098,7 @@ async function testRedisMemoryPersistence(
     return false;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("ECONNREFUSED") ||
-      msg.includes("Redis")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest(
         "5. Redis Memory Persistence",
         "SKIP",
@@ -1146,6 +1125,9 @@ async function testRedisMemoryPersistence(
 // ============================================================
 // TEST #6: Redis Connection Pooling
 // ============================================================
+
+/** Fewest concurrently completed Redis-backed instances that still exercise a shared pool. */
+const MIN_POOLED_INSTANCES = 2;
 
 async function testRedisConnectionPooling(
   sdk: NeuroLink,
@@ -1211,11 +1193,7 @@ async function testRedisConnectionPooling(
       if (f.status === "rejected") {
         const msg =
           f.reason instanceof Error ? f.reason.message : String(f.reason);
-        if (
-          !isExpectedProviderError(msg) &&
-          !msg.includes("Redis") &&
-          !msg.includes("ECONNREFUSED")
-        ) {
+        if (!isExpectedProviderError(msg)) {
           logTest(
             "6. Redis Connection Pooling",
             "FAIL",
@@ -1247,7 +1225,18 @@ async function testRedisConnectionPooling(
     });
 
     if (succeeded + providerFailures.length === 3) {
-      // All failures were provider-related, not Redis pooling issues
+      // Every failure was a provider error, not a Redis one. That is only a
+      // pass when enough instances completed to have shared the pool: a call
+      // that failed at the provider never reached its Redis turn store, so
+      // "0/3 succeeded" says nothing about pooling and used to pass anyway.
+      if (succeeded < MIN_POOLED_INSTANCES) {
+        logTest(
+          "6. Redis Connection Pooling",
+          "SKIP",
+          `only ${succeeded}/3 concurrent instances completed (${providerFailures.length} provider errors); pooling needs at least ${MIN_POOLED_INSTANCES}`,
+        );
+        return null;
+      }
       logTest(
         "6. Redis Connection Pooling",
         "PASS",
@@ -1264,11 +1253,7 @@ async function testRedisConnectionPooling(
     return false;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("ECONNREFUSED") ||
-      msg.includes("Redis")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest(
         "6. Redis Connection Pooling",
         "SKIP",
@@ -1365,11 +1350,7 @@ async function testMemoryRetrievalTool(
     return false;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("Redis") ||
-      msg.includes("ECONNREFUSED")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest("7. Memory Retrieval Tool", "SKIP", msg);
       return null;
     }
@@ -1513,11 +1494,7 @@ async function testConversationTitleGeneration(
     return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("Redis") ||
-      msg.includes("ECONNREFUSED")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest("9. Conversation Title Generation", "SKIP", msg);
       return null;
     }
@@ -1533,92 +1510,134 @@ async function testConversationTitleGeneration(
 }
 
 // ============================================================
-// TEST #9b: Title No-Ellipsis Unit Assertion
+// TEST #9b: Title No-Ellipsis
 // ============================================================
+
+/** Longest the stored title may take to appear after generate() returns. */
+const TITLE_WAIT_MS = 60_000;
+
+/** What a session is listed under until its generated title is stored. */
+const PLACEHOLDER_TITLE = "New Conversation";
 
 async function testTitleNoEllipsis(sdk: NeuroLink): Promise<boolean | null> {
   logTest("9b. Title No-Ellipsis (unit)", "TESTING");
 
-  // Dynamically import the manager directly so we can call generateConversationTitle
-  // without needing a full Redis-backed NeuroLink session.
-  let RedisConversationMemoryManagerClass: typeof import("../dist/core/redisConversationMemoryManager.js").RedisConversationMemoryManager;
-  try {
-    const mod = await import("../dist/core/redisConversationMemoryManager.js");
-    RedisConversationMemoryManagerClass = mod.RedisConversationMemoryManager;
-  } catch (importError) {
-    const msg =
-      importError instanceof Error ? importError.message : String(importError);
-    logTest(
-      "9b. Title No-Ellipsis (unit)",
-      "SKIP",
-      `Could not import manager: ${msg}`,
-    );
-    return null;
-  }
-
-  // Instantiate with minimal config — no Redis needed for this assertion
-  const manager = new RedisConversationMemoryManagerClass({ enabled: false });
-
-  // Use a long, descriptive prompt that would previously have triggered the 60-char truncation
+  // Drives the public path a caller reaches: generate() with Redis-backed
+  // memory stores the first turn, a background call asks the summarization
+  // model for a title, and listSessions() reports what was stored. The
+  // title generator is not a public export, so there is no way to call it
+  // directly from here.
   const longUserMessage =
     "Can you explain the differences between supervised, unsupervised, and reinforcement learning in machine learning, with examples?";
+  // When that background call fails, the memory manager stores a title cut
+  // from the message itself instead (30 characters plus an ellipsis). It is
+  // the same shape as the truncation this case guards against, so it has to
+  // be told apart: it means the summarization provider was not usable here.
+  const messagePrefixFallbackTitle = `${longUserMessage.substring(0, 30)}...`;
 
-  let title: string;
+  const sessionId = generateTestSessionId("title-no-ellipsis");
+  const userId = `title-no-ellipsis-user-${randomUUID().slice(0, 8)}`;
+  const redisConfig = REDIS_URL
+    ? { url: REDIS_URL }
+    : { host: REDIS_HOST || "localhost", port: REDIS_PORT || 6379 };
+
+  let memorySdk: NeuroLink | null = null;
   try {
-    title = await manager.generateConversationTitle(longUserMessage);
-  } catch (generateError) {
-    const msg =
-      generateError instanceof Error
-        ? generateError.message
-        : String(generateError);
+    memorySdk = new NeuroLink({
+      conversationMemory: {
+        enabled: true,
+        enableSummarization: false,
+        redisConfig,
+      },
+    });
+
+    await memorySdk.generate({
+      input: { text: longUserMessage },
+      maxTokens: Math.min(TEST_CONFIG.maxTokens || 300, 300),
+      ...buildBaseSDKOptions(),
+      context: { sessionId, userId },
+    });
+
+    let title: string | undefined;
+    const deadline = Date.now() + TITLE_WAIT_MS;
+    while (Date.now() < deadline) {
+      const listed = (await memorySdk.listSessions(userId)).find(
+        (s) => s.id === sessionId,
+      );
+      if (
+        listed &&
+        listed.title !== PLACEHOLDER_TITLE &&
+        listed.title !== sessionId
+      ) {
+        title = listed.title;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    if (title === undefined) {
+      logTest(
+        "9b. Title No-Ellipsis (unit)",
+        "FAIL",
+        `generate() completed but no title was stored within ${TITLE_WAIT_MS / 1000}s`,
+      );
+      return false;
+    }
+
+    if (title === messagePrefixFallbackTitle) {
+      logTest(
+        "9b. Title No-Ellipsis (unit)",
+        "SKIP",
+        "title generation fell back to the message prefix; the summarization provider did not answer in this environment",
+      );
+      return null;
+    }
+
+    if (title.endsWith("...")) {
+      logTest(
+        "9b. Title No-Ellipsis (unit)",
+        "FAIL",
+        `Title was truncated with ellipsis (length ${title.length}), expected the complete title`,
+      );
+      return false;
+    }
+
+    // Not a degenerate title
+    if (title.trim().length <= 3) {
+      logTest(
+        "9b. Title No-Ellipsis (unit)",
+        "FAIL",
+        `Title is too short to be meaningful (length ${title.trim().length})`,
+      );
+      return false;
+    }
+
+    logTest(
+      "9b. Title No-Ellipsis (unit)",
+      "PASS",
+      `Complete title stored (no ellipsis, length ${title.length})`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
     if (isExpectedProviderError(msg)) {
       logTest("9b. Title No-Ellipsis (unit)", "SKIP", msg);
       return null;
     }
-    logTest(
-      "9b. Title No-Ellipsis (unit)",
-      "FAIL",
-      `generateConversationTitle threw: ${msg}`,
-    );
+    logTest("9b. Title No-Ellipsis (unit)", "FAIL", msg);
     return false;
+  } finally {
+    try {
+      await memorySdk?.clearConversationSession(sessionId);
+    } catch {
+      /* ignore */
+    }
+    try {
+      await memorySdk?.shutdown?.();
+    } catch {
+      /* ignore */
+    }
   }
-
-  // 1. Must be a non-empty string
-  if (typeof title !== "string" || title.trim().length === 0) {
-    logTest(
-      "9b. Title No-Ellipsis (unit)",
-      "FAIL",
-      `Expected non-empty string, got: ${JSON.stringify(title)}`,
-    );
-    return false;
-  }
-
-  // 2. Must NOT end with "..." — the core behaviour change being tested
-  if (title.endsWith("...")) {
-    logTest(
-      "9b. Title No-Ellipsis (unit)",
-      "FAIL",
-      `Title was truncated with ellipsis: "${title}"`,
-    );
-    return false;
-  }
-
-  // 3. Must be longer than 3 characters (not a degenerate fallback)
-  if (title.trim().length <= 3) {
-    logTest(
-      "9b. Title No-Ellipsis (unit)",
-      "FAIL",
-      `Title is too short to be meaningful: "${title}"`,
-    );
-    return false;
-  }
-
-  logTest(
-    "9b. Title No-Ellipsis (unit)",
-    "PASS",
-    `Complete title returned (no ellipsis): "${title}"`,
-  );
-  return true;
 }
 
 // ============================================================
@@ -1714,11 +1733,7 @@ async function testCLIMemoryPersistence(): Promise<boolean | null> {
     return false;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("ECONNREFUSED") ||
-      msg.includes("Redis")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest(
         "10. CLI Memory Persistence",
         "SKIP",
@@ -1904,6 +1919,7 @@ async function testMemoryWithLargeContext(
     // Generate many turns to stress the memory system
     const turnCount = 15;
     let successfulTurns = 0;
+    let providerSkippedTurns = 0;
 
     for (let i = 0; i < turnCount; i++) {
       try {
@@ -1937,12 +1953,25 @@ async function testMemoryWithLargeContext(
         const turnMsg =
           turnError instanceof Error ? turnError.message : String(turnError);
         if (isExpectedProviderError(turnMsg)) {
+          providerSkippedTurns++;
           log(`   Turn ${i + 1} skipped: provider error`, "yellow");
           continue;
         }
         // Context overflow or other errors - check if compaction handled it
         log(`   Turn ${i + 1} error: ${turnMsg.substring(0, 100)}`, "yellow");
       }
+    }
+
+    // A provider that answered none of the turns never put anything in memory,
+    // so there is nothing to judge. Only a turn that failed for some other
+    // reason counts against the case, so this has to account for every turn.
+    if (successfulTurns === 0 && providerSkippedTurns === turnCount) {
+      logTest(
+        "12. Memory with Large Context",
+        "SKIP",
+        `all ${turnCount} turns hit expected provider errors; large-context memory not exercised`,
+      );
+      return null;
     }
 
     // FIX #13: Raise threshold from 5/15 to 10/15. If fewer than 10 turns succeed, FAIL.
@@ -1958,7 +1987,7 @@ async function testMemoryWithLargeContext(
     logTest(
       "12. Memory with Large Context",
       "FAIL",
-      `Only ${successfulTurns}/${turnCount} turns succeeded (need at least 10)`,
+      `Only ${successfulTurns}/${turnCount} turns succeeded (need at least 10; ${providerSkippedTurns} hit provider errors)`,
     );
     return false;
   } catch (error) {
@@ -2070,11 +2099,7 @@ async function testMemoryAcrossSessions(
     return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("Redis") ||
-      msg.includes("ECONNREFUSED")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest("13. Memory Across Sessions", "SKIP", msg);
       return null;
     }
@@ -2393,11 +2418,7 @@ async function testToolResultStoredInRedis(): Promise<boolean | null> {
     return true;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (
-      isExpectedProviderError(msg) ||
-      msg.includes("ECONNREFUSED") ||
-      msg.includes("Redis")
-    ) {
+    if (isExpectedProviderError(msg)) {
       logTest(
         "21. Tool result content stored correctly in Redis",
         "SKIP",
@@ -2415,6 +2436,19 @@ async function testToolResultStoredInRedis(): Promise<boolean | null> {
     }
   }
 }
+
+/**
+ * Test 22 drives the native Vertex path, so it also skips when Application
+ * Default Credentials cannot supply a project. The shared matcher already
+ * recognises the missing-credential wording (`GOOGLE_APPLICATION_CREDENTIALS`,
+ * "default credentials"); this is google-auth-library's own message for the
+ * project half (googleauth.js, GoogleAuth#getProjectId), which it does not.
+ * Bare "vertex", "project_id" and "credential" would also swallow real
+ * native-path regressions, so none of them is accepted.
+ */
+const VERTEX_NATIVE_OPT_IN_FRAMINGS: readonly RegExp[] = [
+  /\bunable to detect a project id in the current environment\b/i,
+];
 
 // ============================================================
 // Native-path tool storage assertion
@@ -2586,13 +2620,7 @@ async function testNativePathStoresToolRowsInRedis(): Promise<boolean | null> {
     const msg = error instanceof Error ? error.message : String(error);
     if (
       isExpectedProviderError(msg) ||
-      msg.includes("ECONNREFUSED") ||
-      msg.includes("Redis") ||
-      // Narrow Vertex auth signals only — bare "vertex" would swallow real
-      // native-path regressions.
-      msg.includes("GOOGLE_APPLICATION_CREDENTIALS") ||
-      msg.includes("project_id") ||
-      msg.toLowerCase().includes("credential")
+      VERTEX_NATIVE_OPT_IN_FRAMINGS.some((re) => re.test(msg))
     ) {
       logTest(
         testName,
@@ -3330,13 +3358,6 @@ async function testAbortDoesNotPersistSentinel(): Promise<boolean | null> {
         msg.toLowerCase().includes("timed out");
       if (looksLikeAbort) {
         sawAbort = true;
-      } else if (isExpectedProviderError(msg)) {
-        logTest(
-          "16. Abort path does not persist sentinel into memory",
-          "SKIP",
-          `Provider unavailable: ${msg}`,
-        );
-        return null;
       } else {
         throw err;
       }
@@ -3383,15 +3404,9 @@ async function testAbortDoesNotPersistSentinel(): Promise<boolean | null> {
     );
     return true;
   } catch (error) {
+    // No provider is reached here: the signal is aborted before generate()
+    // starts, so any other error is a finding, never a skip.
     const msg = error instanceof Error ? error.message : String(error);
-    if (isExpectedProviderError(msg)) {
-      logTest(
-        "16. Abort path does not persist sentinel into memory",
-        "SKIP",
-        msg,
-      );
-      return null;
-    }
     logTest(
       "16. Abort path does not persist sentinel into memory",
       "FAIL",

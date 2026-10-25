@@ -17,6 +17,7 @@
 import { observeGeneration } from "../telemetry/observation.js";
 import { StepSpans, withGeneration } from "../telemetry/withSpan.js";
 import { logger } from "../utils/logger.js";
+import { convertZodToJsonSchema } from "../utils/schemaConversion.js";
 import type {
   FinishReason,
   GenerationRecord,
@@ -29,6 +30,7 @@ import type {
   ToolExecutionSummaryInternal,
 } from "../types/index.js";
 import { guardToolExecutor } from "./toolExecutionGuards.js";
+import { resolveLiveTool } from "../tools/toolDiscovery.js";
 
 const DEFAULT_TOOL_CHOICE_STEPS = 1;
 
@@ -102,9 +104,9 @@ const warnUndeclaredForcedTool = (
 
 /**
  * The names this request actually carries, in the record shape
- * `declaredTools` takes. The loop sends `args.tools`, built once by the
- * caller; `args.toolsRecord` can hold more (discovery hydrates into it, and
- * this loop never re-declares), so only `tools` answers "is it offered".
+ * `declaredTools` takes. `args.toolsRecord` can hold more than is declared
+ * (discovery hydrates into it), so only the sent declarations answer "is it
+ * offered".
  * Null prototype: a tool may be named `__proto__` or `constructor`.
  */
 const declaredToolRecord = (
@@ -441,6 +443,45 @@ const parseToolInput = (raw: unknown): { input: unknown; error?: string } => {
   }
 };
 
+/** A tool's inputSchema with its lazy (function) form, if any, resolved. */
+export const resolveToolInputSchema = (
+  schema: Tool["inputSchema"],
+): Exclude<Tool["inputSchema"], (...args: never[]) => unknown> =>
+  typeof schema === "function" ? resolveToolInputSchema(schema()) : schema;
+
+/**
+ * The provider-neutral declaration of one tool: the shape every provider's
+ * `doGenerate` already converts to its own wire format. The loop uses it for
+ * the tools discovery loads mid-turn, and the providers that run the loop use
+ * it for their initial declarations, so a tool is declared the same way
+ * whether it is there at the start or joins later.
+ */
+export const toNativeToolDeclaration = (name: string, tool: Tool) => ({
+  type: "function" as const,
+  name,
+  description: tool.description ?? "",
+  inputSchema: declaredInputSchema(name, tool),
+});
+
+// A lazy schema that throws must not take the whole request down: SageMaker and
+// Anthropic declared any function-valued schema as the empty object schema
+// before the lazy form was resolved here, so a broken one falls back to that.
+function declaredInputSchema(name: string, tool: Tool): object {
+  const empty = { type: "object", properties: {} };
+  if (!tool.inputSchema) {
+    return empty;
+  }
+  try {
+    return convertZodToJsonSchema(resolveToolInputSchema(tool.inputSchema));
+  } catch (error) {
+    logger.warn(
+      `[nativeGenerateLoop] input schema of tool "${name}" could not be resolved; declaring it with an empty object schema`,
+      { error: error instanceof Error ? error.message : String(error) },
+    );
+    return empty;
+  }
+}
+
 /**
  * Validate parsed input against the tool's own schema when it exposes one.
  *
@@ -451,13 +492,18 @@ const parseToolInput = (raw: unknown): { input: unknown; error?: string } => {
  * validator this loop has no business carrying.
  */
 const validateToolInput = (
-  tool: { inputSchema?: unknown } | undefined,
+  tool: Tool | undefined,
   input: unknown,
 ): string | undefined => {
-  const schema = tool?.inputSchema as
-    | { safeParse?: (v: unknown) => { success: boolean; error?: unknown } }
-    | undefined;
-  if (typeof schema?.safeParse !== "function") {
+  const schema = tool?.inputSchema
+    ? resolveToolInputSchema(tool.inputSchema)
+    : undefined;
+  if (
+    !schema ||
+    typeof schema !== "object" ||
+    !("safeParse" in schema) ||
+    typeof schema.safeParse !== "function"
+  ) {
     return undefined;
   }
   const result = schema.safeParse(input);
@@ -595,7 +641,7 @@ export async function runNativeGenerateLoop(
   args: NativeGenerateLoopArgs,
   toolExecutionSummaries: ToolExecutionSummaryInternal[],
 ): Promise<NativeGenerateLoopResult> {
-  const stepSpans = new StepSpans();
+  const stepSpans = new StepSpans("generate");
   try {
     return await runGenerateSteps(args, toolExecutionSummaries, stepSpans);
   } finally {
@@ -632,12 +678,34 @@ async function runGenerateSteps(
     | { text: string; finishReason: string; rawFinishReason?: string }
     | undefined;
   const hasTools = Boolean(args.tools && args.tools.length > 0);
+  // The declarations actually sent. It is the caller's own array and grows in
+  // place when a tool joins toolsRecord mid-turn (discovery loads tools into
+  // it), so anything the caller sized from it, such as the context guard's
+  // fixed-overhead estimate, counts the new tools too.
+  const liveTools = args.tools;
+  const declare = args.declareTool ?? toNativeToolDeclaration;
+  const declaredNames = declaredToolRecord(args.tools);
   // Completed-step records for `prepareStep`; one per step that returned.
   const stepRecords: StepResult<Record<string, Tool>>[] = [];
 
   for (let step = 0; step < args.maxSteps; step++) {
     steps = step + 1;
     stepSpans.begin(steps);
+    if (liveTools) {
+      const loaded: string[] = [];
+      for (const name of Object.keys(args.toolsRecord)) {
+        if (!declaredNames[name]) {
+          liveTools.push(declare(name, args.toolsRecord[name]));
+          declaredNames[name] = true;
+          loaded.push(name);
+        }
+      }
+      if (loaded.length > 0) {
+        logger.debug(
+          `[nativeGenerateLoop] ${loaded.length} tool(s) hydrated mid-turn via discovery: ${loaded.join(", ")}`,
+        );
+      }
+    }
     // The forced-choice window and the caller's hook are resolved BEFORE the
     // re-ask override below: the re-ask has to win, since its whole point is
     // a request with tools disabled.
@@ -653,7 +721,7 @@ async function runGenerateSteps(
           steps: stepRecords,
           maxSteps: args.maxSteps,
           model: args.modelId,
-          declaredTools: declaredToolRecord(args.tools),
+          declaredTools: declaredToolRecord(liveTools),
           ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
         })
       : undefined;
@@ -675,7 +743,7 @@ async function runGenerateSteps(
     const runThisStep = () =>
       generateObservedStep(args, {
         prompt: args.conversation,
-        ...(args.tools && args.tools.length > 0 ? { tools: args.tools } : {}),
+        ...(liveTools && liveTools.length > 0 ? { tools: liveTools } : {}),
         // The v3 call option is an OBJECT — `{ type: "none" }`. Passing the
         // bare string "none" type-checks against `unknown` and is then
         // dropped by every converter that switches on `choice.type`, so the
@@ -864,12 +932,9 @@ async function runGenerateSteps(
       const startTime = new Date();
       const parsed = parseToolInput(call.input);
       const input = parsed.input;
-      const tool = args.toolsRecord[name] as
-        | {
-            execute?: (a: unknown, c: unknown) => Promise<unknown>;
-            inputSchema?: unknown;
-          }
-        | undefined;
+      // resolveLiveTool also loads a deferred tool the model called by its
+      // catalog name without searching first.
+      const tool = resolveLiveTool(args.toolsRecord, name);
 
       let output: unknown;
       let failure: string | undefined;

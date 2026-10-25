@@ -98,6 +98,7 @@ import {
   hasNativeDoGenerate,
   resolveStepToolChoice,
   runNativeGenerateLoop,
+  toNativeToolDeclaration,
   toPrepareStepRecord,
 } from "../core/nativeGenerateLoop.js";
 import {
@@ -1252,17 +1253,9 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
 
     // v3 tool shape — the same one doGenerate already converts internally.
     const v3Tools = shouldUseTools
-      ? Object.entries(toolsRecord).map(([name, t]) => {
-          const tool = t as { description?: string; inputSchema?: unknown };
-          return {
-            type: "function" as const,
-            name,
-            description: tool.description ?? "",
-            inputSchema: (tool.inputSchema
-              ? convertZodToJsonSchema(tool.inputSchema as never)
-              : { type: "object", properties: {} }) as Record<string, unknown>,
-          };
-        })
+      ? Object.entries(toolsRecord).map(([name, t]) =>
+          toNativeToolDeclaration(name, t),
+        )
       : undefined;
     const hasTools = !!v3Tools && v3Tools.length > 0;
 
@@ -1303,6 +1296,9 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
       // legal again on a vendor that refuses the two together.
       withTools: boolean = true,
     ) => {
+      // What this pass sends: the initial declarations, which the loop appends
+      // to for tools discovery loads mid-turn, so the guard counts them too.
+      const passTools = withTools && v3Tools ? [...v3Tools] : undefined;
       return runNativeGenerateLoop(
         {
           doGenerate,
@@ -1329,14 +1325,14 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
             getFixedOverheadTokens: () =>
               estimateTokens(
                 serializeForEstimate({
-                  ...(withTools && v3Tools ? { tools: v3Tools } : {}),
+                  ...(passTools ? { tools: passTools } : {}),
                   responseFormat: format,
                 }),
                 this.providerName,
               ),
           }),
           conversation: conv,
-          ...(withTools && v3Tools ? { tools: v3Tools } : {}),
+          ...(passTools ? { tools: passTools } : {}),
           toolsRecord,
           ...(withTools && hasTools && options.toolChoice
             ? { toolChoice: resolveToolChoice(options, toolsRecord, true) }
@@ -2502,9 +2498,9 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         // a blanket "stop" for every stream that drained without throwing.
         streamMetadata.finishReason = toUnifiedFinishReason(rawFinishReason);
         // No-output path: stream completed normally but yielded zero text.
-        // Build an enriched sentinel + stamp the active OTel span so
-        // Pipeline B (ContextEnricher) surfaces a WARNING-level Langfuse
-        // observation instead of silently succeeding.
+        // Build an enriched sentinel + stamp the active OTel span with the
+        // WARNING observation level, which ExporterSpanProcessor exports,
+        // so the observation does not read as a silent success.
         if (contentYielded === 0 && toolsUsed.length === 0) {
           logger.warn(
             `${providerName}: Stream produced no output — emitting enriched sentinel`,
@@ -2695,7 +2691,7 @@ export abstract class OpenAIChatCompletionsProvider extends BaseProvider {
         ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
       };
     };
-    const stepSpans = new StepSpans();
+    const stepSpans = new StepSpans("stream");
     try {
       // May grow mid-turn: hydrated tools with wire-unsafe names need
       // reverse-mapping even when the initial name set required none.

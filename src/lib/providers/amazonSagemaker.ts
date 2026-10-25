@@ -30,10 +30,12 @@ import { DEFAULT_MAX_STEPS } from "../core/constants.js";
 import {
   hasNativeDoGenerate,
   runNativeGenerateLoop,
+  toNativeToolDeclaration,
 } from "../core/nativeGenerateLoop.js";
 import { generationName } from "../telemetry/observationNames.js";
 import { observeGeneration } from "../telemetry/observation.js";
 import { tracers } from "../telemetry/tracers.js";
+import { markFailure } from "../telemetry/withSpan.js";
 // SageMaker-specific imports
 import {
   getDefaultSageMakerEndpoint,
@@ -284,17 +286,9 @@ export class AmazonSageMakerProvider extends BaseProvider {
     const toolsRecord = shouldUseTools
       ? (options.tools as Record<string, Tool>) || {}
       : {};
-    const v3Tools = Object.entries(toolsRecord).map(([name, t]) => {
-      const tool = t as { description?: string; inputSchema?: unknown };
-      return {
-        type: "function" as const,
-        name,
-        description: tool.description ?? "",
-        inputSchema: (tool.inputSchema
-          ? convertZodToJsonSchema(tool.inputSchema as ZodUnknownSchema)
-          : { type: "object", properties: {} }) as Record<string, unknown>,
-      };
-    });
+    const v3Tools = Object.entries(toolsRecord).map(([name, t]) =>
+      toNativeToolDeclaration(name, t),
+    );
 
     // Structured output was dropped entirely on this path: the schema never
     // reached the request, and nothing downstream re-imposed it, so a caller
@@ -508,10 +502,17 @@ export class AmazonSageMakerProvider extends BaseProvider {
           channel.close();
           span.setStatus({ code: SpanStatusCode.OK });
         } catch (error) {
-          span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message: error instanceof Error ? error.message : String(error),
-          });
+          markFailure(span, error);
+          // markFailure leaves an abort at WARNING; the released pump ended
+          // every failure at ERROR, an abort included.
+          try {
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          } catch {
+            // An error whose text cannot be read is already recorded above.
+          }
           channel.error(error);
         } finally {
           reader.releaseLock();
@@ -522,14 +523,23 @@ export class AmazonSageMakerProvider extends BaseProvider {
             settleFinishReason("unknown");
             settleUsage({ inputTokens: 0, outputTokens: 0 });
           }
-          observeGeneration(span, {
-            ...call,
-            output: text,
-            usage: tokens,
-            finishReason: finish,
-            completionStartTime: firstChunkAt,
-          });
-          span.end();
+          // Recording is best effort and span.end() must follow it either
+          // way: this pump is detached, so nothing else would catch a throw.
+          try {
+            observeGeneration(span, {
+              ...call,
+              output: text,
+              usage: tokens,
+              finishReason: finish,
+              completionStartTime: firstChunkAt,
+            });
+          } catch (error) {
+            logger.debug("[SageMaker] Failed to record the stream generation", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          } finally {
+            span.end();
+          }
         }
       })();
 

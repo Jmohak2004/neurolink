@@ -1,4 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
+  INTERNAL_SPAN_ATTRIBUTE,
+  MAX_REDACTED_ATTRIBUTES,
   MIN_STRING_BUDGET_CHARS,
   REDACTED_VALUE,
   TRUNCATION_NOTE_ALLOWANCE_CHARS,
@@ -42,6 +45,7 @@ export const ATTR = {
   NL_COST: "cost",
   NL_STRUCTURED_OUTPUT: "structured_output",
   NL_HAS_FALLBACK: "has_fallback",
+  NL_INTERNAL: INTERNAL_SPAN_ATTRIBUTE,
   MCP_SERVER_ID: "mcp.server_id",
   MCP_TOOL_NAME: "mcp.tool_name",
   MCP_TIMEOUT_MS: "mcp.timeout_ms",
@@ -151,6 +155,66 @@ export function spanAttributeMaxChars(): number {
   return Math.max(SPAN_ATTRIBUTE_MIN_CHARS, configured);
 }
 
+/**
+ * @description Tells whether span inputs (prompts, messages and tool arguments) are recorded. `NEUROLINK_RECORD_INPUTS=false`, in any casing and with or without surrounding spaces, turns it off; any other value, or none, leaves it on, except inside `withoutSpanContent`. Read on every call, so a change applies to the next span.
+ * @returns {boolean} `false` when the operator opted out of recording inputs.
+ */
+export function recordsSpanInputs(): boolean {
+  return (
+    recordsSpanContent() &&
+    process.env.NEUROLINK_RECORD_INPUTS?.trim().toLowerCase() !== "false"
+  );
+}
+
+const contentWithheld = new AsyncLocalStorage<boolean>();
+
+/**
+ * @description Runs `fn` with span content withheld: an observation recorded while it runs, or while anything it starts runs, keeps its model, usage, cost, level and timings but no input or output. The proxy uses it for a model call made on a client's behalf, whose content it records only when bodies are opted in.
+ * @param fn {() => T} - Work whose observations carry no content.
+ * @returns {T} Whatever `fn` returns.
+ */
+export function withoutSpanContent<T>(fn: () => T): T {
+  return contentWithheld.run(true, fn);
+}
+
+/**
+ * @description Tells whether span input and output may be recorded here, i.e. the caller is not inside `withoutSpanContent`.
+ * @returns {boolean} `false` while content is withheld.
+ */
+export function recordsSpanContent(): boolean {
+  return contentWithheld.getStore() !== true;
+}
+
+// Strings this module returned as finished attributes. A caller that builds an
+// attribute with `spanContentAttribute` or `spanModelRequestAttribute` and
+// hands it to `observe` would otherwise have it redacted again, and a second
+// pass over serialized JSON reads an escaped newline as part of a credential's
+// value. Redacting a string that already came out of redaction cannot reveal
+// anything new, so recognizing it is safe; a string that was evicted is simply
+// redacted again, as before.
+const finishedAttributes = new Set<string>();
+
+function finished(attribute: string): string {
+  finishedAttributes.delete(attribute);
+  finishedAttributes.add(attribute);
+  if (finishedAttributes.size > MAX_REDACTED_ATTRIBUTES) {
+    const oldest = finishedAttributes.values().next().value;
+    if (oldest !== undefined) {
+      finishedAttributes.delete(oldest);
+    }
+  }
+  return attribute;
+}
+
+/**
+ * @description Tells whether a string is an attribute that `spanContentAttribute` or `spanModelRequestAttribute` returned recently, so it is already redacted and capped.
+ * @param value {string} - Candidate attribute value.
+ * @returns {boolean} `true` when the string came out of one of those functions.
+ */
+export function isFinishedAttribute(value: string): boolean {
+  return finishedAttributes.has(value);
+}
+
 /** Opening of the system prompt a model-request attribute always keeps. */
 const SYSTEM_PROMPT_FLOOR_CHARS = 2_000;
 /** Room the current question always gets in a model-request attribute. */
@@ -214,7 +278,88 @@ function redactText(text: string): string {
   return redacted;
 }
 
-function redactNode(value: unknown, ancestors: WeakSet<object>): unknown {
+// Opt-in stricter masking (`NEUROLINK_MASK_CREDENTIAL_ENTRIES=true`): the value
+// of a `{ name, value }` or `{ key, value }` entry whose name is a credential,
+// and a credential inside an object key. The released masker reads keys and
+// text only, so with the variable unset the output is exactly what it was.
+function masksCredentialEntries(): boolean {
+  return (
+    process.env.NEUROLINK_MASK_CREDENTIAL_ENTRIES?.trim().toLowerCase() ===
+    "true"
+  );
+}
+
+// A name that says how many, how long or what kind of thing rather than
+// holding the credential (`max_tokens`, `password_policy`, `credential_type`,
+// `secret_version`, `password_min_length`). A name that merely ends in `tokens`
+// is not one: `access_tokens` and `refresh_tokens` are credentials, so only a
+// bare `tokens` and the count-like names of a model's token budget and usage
+// (`max_tokens`, `prompt_tokens`, `cache_read_input_tokens`, ...) are exempt.
+// Decided on the name's segments, not with a pattern: a key comes from content
+// and may be very long, so the check must stay linear in its length.
+const MEASUREMENT_SUFFIXES = new Set([
+  "policy",
+  "type",
+  "algorithm",
+  "count",
+  "limit",
+  "version",
+  "length",
+]);
+const TOKEN_COUNT_PREFIXES = new Set([
+  "max",
+  "min",
+  "prompt",
+  "completion",
+  "input",
+  "output",
+  "total",
+  "cache",
+  "cached",
+  "reasoning",
+  "thinking",
+  "budget",
+  "context",
+]);
+
+function isMeasurementEntryName(name: string): boolean {
+  const segments = snakeCased(name).split("_");
+  const last = segments[segments.length - 1];
+  if (segments.length === 1) {
+    return last === "tokens";
+  }
+  return (
+    MEASUREMENT_SUFFIXES.has(last) ||
+    (last === "tokens" && TOKEN_COUNT_PREFIXES.has(segments[0]))
+  );
+}
+
+function snakeCased(name: string): string {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s.-]+/g, "_")
+    .toLowerCase();
+}
+
+// Headers, environment variables and form fields are often lists of
+// `{ name, value }` or `{ key, value }` entries; when the name is a credential
+// the value is one, exactly as if it were stored under that key, whatever the
+// value looks like (a numeric PIN is a credential). Only the name decides: a
+// setting that merely mentions a credential is not one.
+function credentialEntryName(node: object): string | undefined {
+  const name =
+    "name" in node ? node.name : "key" in node ? node.key : undefined;
+  if (typeof name !== "string" || !("value" in node) || !isSensitiveKey(name)) {
+    return undefined;
+  }
+  return isMeasurementEntryName(name) ? undefined : name;
+}
+
+function redactNode(
+  value: unknown,
+  ancestors: WeakSet<object>,
+  strict: boolean,
+): unknown {
   if (typeof value === "string") {
     return redactText(describeDataUrls(value));
   }
@@ -230,27 +375,37 @@ function redactNode(value: unknown, ancestors: WeakSet<object>): unknown {
   ancestors.add(value);
   try {
     if ("toJSON" in value && typeof value.toJSON === "function") {
-      return redactNode(value.toJSON(), ancestors);
+      return redactNode(value.toJSON(), ancestors, strict);
     }
     if (Array.isArray(value)) {
-      return value.map((entry) => redactNode(entry, ancestors));
+      return value.map((entry) => redactNode(entry, ancestors, strict));
     }
     // No prototype, so a key named __proto__ is data rather than an assignment.
     const redacted: Record<string, unknown> = Object.create(null);
     const mimeType = declaredMimeType(value);
+    const entryName = strict ? credentialEntryName(value) : undefined;
     for (const [key, entry] of Object.entries(value)) {
+      // Opt-in: a key can carry a credential too, such as a URL with an
+      // api_key parameter used as a map key.
+      const safeKey = strict ? redactText(key) : key;
+      const sensitiveName =
+        key === "value" && entryName !== undefined
+          ? entryName
+          : isSensitiveKey(key)
+            ? key
+            : undefined;
       if (
-        isSensitiveKey(key) &&
+        sensitiveName !== undefined &&
         (typeof entry === "string" ||
           (typeof entry === "object" && entry !== null))
       ) {
-        redacted[key] = redactSensitiveEntry(key, entry);
+        redacted[safeKey] = redactSensitiveEntry(sensitiveName, entry);
         continue;
       }
       const placeholder = isBinaryKey(key)
         ? binaryPlaceholder(entry, mimeType)
         : undefined;
-      redacted[key] = placeholder ?? redactNode(entry, ancestors);
+      redacted[safeKey] = placeholder ?? redactNode(entry, ancestors, strict);
     }
     return redacted;
   } finally {
@@ -259,13 +414,13 @@ function redactNode(value: unknown, ancestors: WeakSet<object>): unknown {
 }
 
 /**
- * @description Returns a copy of a value with credentials masked: values under keys such as `access_token`, `password`, `authorization` or `set-cookie`, bearer tokens, and `name=value` credentials inside text. Purely numeric values after a credential-looking name (e.g. `max_tokens: 4096`) are left alone.
+ * @description Returns a copy of a value with credentials masked: values under keys such as `access_token`, `password`, `authorization` or `set-cookie`, bearer tokens, and `name=value` credentials inside text. Purely numeric values after a credential-looking name (e.g. `max_tokens: 4096`) are left alone. With `NEUROLINK_MASK_CREDENTIAL_ENTRIES=true` it also masks the value of a `{ name, value }` or `{ key, value }` entry whose name is such a key (a setting such as `max_tokens`, `password_policy` or `secret_version` is not, and the value is not consulted, so a numeric PIN is masked) and a credential inside an object key; unset, it does neither, as in the released build.
  * @param value {JsonValue | object} - Content to redact; objects and arrays are walked recursively.
  * @returns {JsonValue | object} A redacted copy, serializing exactly as the input when nothing in it is sensitive.
  * @throws {Error} When the value cannot be walked; tracing callers use `spanContentAttribute`, which turns that into an omitted value.
  */
 export function redactSpanContent(value: unknown): unknown {
-  return redactNode(value, new WeakSet<object>());
+  return redactNode(value, new WeakSet<object>(), masksCredentialEntries());
 }
 
 function redactSafely(value: unknown): unknown {
@@ -292,7 +447,7 @@ export function spanContentAttribute(
 ): string {
   const redacted = redactSafely(value);
   if (redacted === null || typeof redacted !== "object") {
-    return spanJsonAttribute(redacted, maxChars);
+    return finished(spanJsonAttribute(redacted, maxChars));
   }
   let serialized = stringify(redacted);
   let budget = Math.floor(maxChars / 4);
@@ -300,7 +455,7 @@ export function spanContentAttribute(
     serialized = stringify(capStrings(redacted, budget));
     budget = Math.floor(budget / 4);
   }
-  return spanJsonAttribute(serialized, maxChars);
+  return finished(spanJsonAttribute(serialized, maxChars));
 }
 
 /**
@@ -578,8 +733,8 @@ export function spanModelRequestAttribute(
     ...(prompt !== undefined ? [{ role: "user", content: prompt }] : []),
   ];
   try {
-    return JSON.stringify(conversation);
+    return finished(JSON.stringify(conversation));
   } catch {
-    return spanJsonAttribute(conversation, maxChars);
+    return finished(spanJsonAttribute(conversation, maxChars));
   }
 }

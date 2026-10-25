@@ -30,8 +30,19 @@ import "dotenv/config";
 import { z } from "zod";
 import { tool } from "../dist/index.js";
 import { MCPToolRegistry, NeuroLink } from "../dist/index.js";
-import type { Tool, ToolInfo } from "../src/lib/types/index.js";
+import type {
+  GenerateOptions,
+  Tool,
+  ToolConfig,
+  ToolInfo,
+} from "../src/lib/types/index.js";
 import { defineSuite, logSection } from "./helpers/harness.js";
+import {
+  chatCompletion,
+  mockOpenAICredentials,
+  startMockChatServer,
+  startScriptedChatServer,
+} from "./helpers/mockChatServer.js";
 
 const { test, runSuite } = defineSuite("Tool Resolution", {
   offline: true,
@@ -191,6 +202,401 @@ async function main() {
     nl.pinDiscoveredTools("s-overflow", ["t"]);
     assertEqual([...nl.getDiscoveryPins("s-0")], ["t"], "touched survives");
     assertEqual([...nl.getDiscoveryPins("s-1")], [], "untouched LRU evicted");
+  });
+
+  const REGISTERED_TOOLS = ["keep_time", "orders_lookup", "sales_report"];
+
+  // What reached the wire: the tool names, and the search_tools description.
+  const sendWithRegisteredTools = async (
+    tools: ToolConfig,
+    extra: Pick<GenerateOptions, "toolFilter" | "toolChoice"> = {},
+    setUp?: (nl: NeuroLink) => void,
+  ): Promise<{ names: string[]; searchDescription: string }> => {
+    const server = await startMockChatServer();
+    const nl = new NeuroLink({ tools });
+    setUp?.(nl);
+    for (const name of REGISTERED_TOOLS) {
+      nl.registerTool(name, {
+        name,
+        description: `The ${name} tool.`,
+        inputSchema: { type: "object", properties: {}, required: [] },
+        execute: async () => ({ ok: true }),
+      });
+    }
+    try {
+      await nl.generate({
+        input: { text: "hello" },
+        provider: "openai",
+        model: "gpt-4o-mini",
+        disableInternalFallback: true,
+        credentials: mockOpenAICredentials(server),
+        context: { sessionId: "discovery-scope-session" },
+        ...extra,
+      });
+      const body = JSON.parse(server.getLastRequestBody() ?? "{}") as {
+        tools?: Array<{ function?: { name?: string; description?: string } }>;
+      };
+      const declared = (body.tools ?? []).map((entry) => entry.function ?? {});
+      return {
+        names: declared.map((fn) => fn.name ?? ""),
+        searchDescription:
+          declared.find((fn) => fn.name === "search_tools")?.description ?? "",
+      };
+    } finally {
+      await nl.shutdown();
+      await server.close();
+    }
+  };
+
+  await test("discovery: true alone still never defers registered tools", async () => {
+    const { names } = await sendWithRegisteredTools({ discovery: true });
+    for (const name of REGISTERED_TOOLS) {
+      if (!names.includes(name)) {
+        throw new Error(`${name} was not sent in full: ${names.join(",")}`);
+      }
+    }
+  });
+
+  await test('discoveryScope "all" defers registered tools except discoveryAlwaysVisible', async () => {
+    const { names, searchDescription } = await sendWithRegisteredTools({
+      discovery: true,
+      discoveryScope: "all",
+      discoveryAlwaysVisible: ["keep_*"],
+    });
+    if (!names.includes("search_tools")) {
+      throw new Error(`search_tools missing: ${names.join(",")}`);
+    }
+    if (!names.includes("keep_time")) {
+      throw new Error("always-visible keep_time was deferred");
+    }
+    for (const deferred of ["orders_lookup", "sales_report"]) {
+      if (names.includes(deferred)) {
+        throw new Error(`${deferred} was sent in full instead of deferred`);
+      }
+      if (!searchDescription.includes(deferred)) {
+        throw new Error(`${deferred} is missing from the search_tools catalog`);
+      }
+    }
+  });
+
+  const asEventPayload = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null ? { ...value } : {};
+
+  const toolCall = (id: string, name: string, args: Record<string, unknown>) =>
+    chatCompletion({
+      finishReason: "tool_calls",
+      toolCalls: [
+        {
+          id,
+          type: "function",
+          function: { name, arguments: JSON.stringify(args) },
+        },
+      ],
+    });
+
+  // A generate() turn against a scripted model, with discovery deferring the
+  // registered tools. Returns the tool events and every request body sent.
+  const runScriptedDiscoveryTurn = async (
+    script: ReturnType<typeof chatCompletion>[],
+    sessionId: string,
+  ): Promise<{
+    events: Array<{ type: string; payload: Record<string, unknown> }>;
+    requestToolNames: string[][];
+  }> => {
+    const server = await startScriptedChatServer(script);
+    const nl = new NeuroLink({
+      tools: { discovery: true, discoveryScope: "all" },
+    });
+    for (const name of REGISTERED_TOOLS) {
+      nl.registerTool(name, {
+        name,
+        description: `The ${name} tool.`,
+        inputSchema: { type: "object", properties: {}, required: [] },
+        execute: async () => ({ ok: true }),
+      });
+    }
+    const events: Array<{ type: string; payload: Record<string, unknown> }> =
+      [];
+    const emitter = nl.getEventEmitter();
+    emitter.on("tool:start", (...args: unknown[]) => {
+      events.push({ type: "start", payload: asEventPayload(args[0]) });
+    });
+    emitter.on("tool:end", (...args: unknown[]) => {
+      events.push({ type: "end", payload: asEventPayload(args[0]) });
+    });
+    try {
+      await nl.generate({
+        input: { text: "find the orders tool" },
+        provider: "openai",
+        model: "gpt-4o-mini",
+        disableInternalFallback: true,
+        credentials: mockOpenAICredentials(server),
+        context: { sessionId },
+      });
+      const requestToolNames = server.getAllRequestBodies().map((raw) => {
+        const body = JSON.parse(raw) as {
+          tools?: Array<{ function?: { name?: string } }>;
+        };
+        return (body.tools ?? []).map((entry) => entry.function?.name ?? "");
+      });
+      return { events, requestToolNames };
+    } finally {
+      await nl.shutdown();
+      await server.close();
+    }
+  };
+
+  const eventsFor = (
+    events: Array<{ type: string; payload: Record<string, unknown> }>,
+    toolName: string,
+  ) => events.filter((event) => event.payload.toolName === toolName);
+
+  await test("a search_tools call emits paired tool:start and tool:end", async () => {
+    const { events } = await runScriptedDiscoveryTurn(
+      [
+        toolCall("call_search", "search_tools", { query: "orders_lookup" }),
+        chatCompletion({ content: "done" }),
+      ],
+      "search-tools-events-session",
+    );
+    const searchEvents = eventsFor(events, "search_tools");
+    assertEqual(
+      searchEvents.map((event) => event.type),
+      ["start", "end"],
+      "search_tools events",
+    );
+    const startId = searchEvents[0].payload.executionId;
+    if (typeof startId !== "string" || startId.length === 0) {
+      throw new Error("search_tools tool:start has no executionId");
+    }
+    if (searchEvents[1].payload.executionId !== startId) {
+      throw new Error(
+        "search_tools tool:end executionId does not match its tool:start",
+      );
+    }
+    const end = searchEvents[1].payload;
+    if (end.success !== true) {
+      throw new Error("search_tools tool:end was not successful");
+    }
+    if (!JSON.stringify(end.result).includes("orders_lookup")) {
+      throw new Error("search_tools result did not load orders_lookup");
+    }
+  });
+
+  await test("generate() declares and runs a tool search_tools loaded mid-turn", async () => {
+    const { events, requestToolNames } = await runScriptedDiscoveryTurn(
+      [
+        toolCall("call_search", "search_tools", { query: "orders_lookup" }),
+        toolCall("call_orders", "orders_lookup", {}),
+        chatCompletion({ content: "done" }),
+      ],
+      "search-then-call-session",
+    );
+    if (requestToolNames[0]?.includes("orders_lookup")) {
+      throw new Error("orders_lookup was declared before it was searched for");
+    }
+    if (!requestToolNames[1]?.includes("orders_lookup")) {
+      throw new Error(
+        `orders_lookup not declared after the search: ${(requestToolNames[1] ?? []).join(",")}`,
+      );
+    }
+    const ordersEnd = eventsFor(events, "orders_lookup").find(
+      (event) => event.type === "end",
+    );
+    if (ordersEnd?.payload.success !== true) {
+      throw new Error("orders_lookup did not run after being loaded");
+    }
+  });
+
+  await test("generate() runs a deferred tool called by its catalog name without a search", async () => {
+    const { events, requestToolNames } = await runScriptedDiscoveryTurn(
+      [
+        toolCall("call_sales", "sales_report", {}),
+        chatCompletion({ content: "done" }),
+      ],
+      "direct-call-session",
+    );
+    if (requestToolNames[0]?.includes("sales_report")) {
+      throw new Error("sales_report was not deferred on the first request");
+    }
+    const salesEnd = eventsFor(events, "sales_report").find(
+      (event) => event.type === "end",
+    );
+    if (salesEnd?.payload.success !== true) {
+      throw new Error("sales_report did not run on a direct call");
+    }
+  });
+
+  await test("search_tools tells the model to check the catalog before refusing", async () => {
+    const { searchDescription } = await sendWithRegisteredTools({
+      discovery: true,
+      discoveryScope: "all",
+    });
+    if (
+      !searchDescription.includes(
+        "Before telling the user you cannot do something, check this catalog",
+      )
+    ) {
+      throw new Error("search_tools description lacks the catalog instruction");
+    }
+  });
+
+  await test("discoveryScope is ignored while discovery is off", async () => {
+    const { names } = await sendWithRegisteredTools({
+      discoveryScope: "all",
+      discoveryAlwaysVisible: ["keep_*"],
+    });
+    if (names.includes("search_tools")) {
+      throw new Error("search_tools appeared with discovery off");
+    }
+    for (const name of REGISTERED_TOOLS) {
+      if (!names.includes(name)) {
+        throw new Error(`${name} was not sent with discovery off`);
+      }
+    }
+  });
+
+  await test('discoveryScope "all" keeps a per-call toolFilter name in full', async () => {
+    const { names } = await sendWithRegisteredTools(
+      { discovery: true, discoveryScope: "all" },
+      { toolFilter: ["orders_lookup"] },
+    );
+    if (!names.includes("orders_lookup")) {
+      throw new Error("a tool named by toolFilter was deferred");
+    }
+  });
+
+  await test('discoveryScope "all" keeps a forced toolChoice tool in full and defers the rest', async () => {
+    const { names } = await sendWithRegisteredTools(
+      { discovery: true, discoveryScope: "all" },
+      { toolChoice: { type: "tool", toolName: "sales_report" } },
+    );
+    if (!names.includes("sales_report")) {
+      throw new Error("the forced sales_report was deferred");
+    }
+    if (names.includes("orders_lookup")) {
+      throw new Error("orders_lookup was sent in full instead of deferred");
+    }
+  });
+
+  await test("an unknown discoveryScope falls back to external, which defers no registered tool", async () => {
+    const { names } = await sendWithRegisteredTools({
+      discovery: true,
+      discoveryScope: String("everything") as ToolConfig["discoveryScope"],
+    });
+    for (const name of REGISTERED_TOOLS) {
+      if (!names.includes(name)) {
+        throw new Error(`${name} was deferred under the fallback scope`);
+      }
+    }
+  });
+
+  await test("discoveryAlwaysVisible: a bare string is read as one pattern, a malformed value is ignored", async () => {
+    const asList = await sendWithRegisteredTools({
+      discovery: true,
+      discoveryScope: "all",
+      discoveryAlwaysVisible: "keep_*" as unknown as string[],
+    });
+    if (!asList.names.includes("keep_time")) {
+      throw new Error("a bare-string pattern did not keep keep_time hot");
+    }
+    const ignored = await sendWithRegisteredTools({
+      discovery: true,
+      discoveryScope: "all",
+      discoveryAlwaysVisible: 5 as unknown as string[],
+    });
+    if (ignored.names.includes("keep_time")) {
+      throw new Error("a malformed list kept keep_time hot");
+    }
+    if (!ignored.names.includes("search_tools")) {
+      throw new Error("a malformed list switched discovery off");
+    }
+  });
+
+  await test('discoveryScope "all" defers the tools NeuroLink registers for its own features unless discoveryAlwaysVisible names them', async () => {
+    const registerTasks = (nl: NeuroLink) => nl.registerTaskTools();
+    const isTaskTool = (name: string) => name.startsWith("tasks_");
+    const deferred = await sendWithRegisteredTools(
+      { discovery: true, discoveryScope: "all" },
+      {},
+      registerTasks,
+    );
+    if (deferred.names.some(isTaskTool)) {
+      throw new Error("a NeuroLink task tool was sent in full under scope all");
+    }
+    if (!deferred.searchDescription.includes("tasks_create")) {
+      throw new Error("tasks_create is missing from the search_tools catalog");
+    }
+    const kept = await sendWithRegisteredTools(
+      {
+        discovery: true,
+        discoveryScope: "all",
+        discoveryAlwaysVisible: ["tasks_*"],
+      },
+      {},
+      registerTasks,
+    );
+    if (!kept.names.includes("tasks_create")) {
+      throw new Error("discoveryAlwaysVisible did not keep tasks_create hot");
+    }
+  });
+
+  await test('discoveryScope "all": a registered tool search_tools loaded stays in full on the next turn of the same session, and a different session still has it deferred', async () => {
+    const server = await startScriptedChatServer([
+      toolCall("call_search", "search_tools", { query: "orders_lookup" }),
+      chatCompletion({ content: "loaded" }),
+      chatCompletion({ content: "again" }),
+      chatCompletion({ content: "other session" }),
+    ]);
+    const nl = new NeuroLink({
+      tools: { discovery: true, discoveryScope: "all" },
+    });
+    for (const name of REGISTERED_TOOLS) {
+      nl.registerTool(name, {
+        name,
+        description: `The ${name} tool.`,
+        inputSchema: { type: "object", properties: {}, required: [] },
+        execute: async () => ({ ok: true }),
+      });
+    }
+    const turn = (sessionId: string) =>
+      nl.generate({
+        input: { text: "find the orders tool" },
+        provider: "openai",
+        model: "gpt-4o-mini",
+        disableInternalFallback: true,
+        credentials: mockOpenAICredentials(server),
+        context: { sessionId },
+      });
+    try {
+      await turn("pinned-session");
+      await turn("pinned-session");
+      await turn("other-session");
+      const requestToolNames = server.getAllRequestBodies().map((raw) => {
+        const body = JSON.parse(raw) as {
+          tools?: Array<{ function?: { name?: string } }>;
+        };
+        return (body.tools ?? []).map((entry) => entry.function?.name ?? "");
+      });
+      assertEqual(requestToolNames.length, 4, "requests sent");
+      // Request 0 opens turn 1, 1 follows the search, 2 opens the second turn
+      // of the same session, 3 opens a turn of another session.
+      if (requestToolNames[0].includes("orders_lookup")) {
+        throw new Error("orders_lookup was not deferred before the search");
+      }
+      if (!requestToolNames[2].includes("orders_lookup")) {
+        throw new Error("the pinned orders_lookup was deferred again");
+      }
+      if (requestToolNames[2].includes("sales_report")) {
+        throw new Error("sales_report was sent in full on the pinned turn");
+      }
+      if (requestToolNames[3].includes("orders_lookup")) {
+        throw new Error("the pin leaked into a different session");
+      }
+    } finally {
+      await nl.shutdown();
+      await server.close();
+    }
   });
 
   logSection("Part 5 — Mid-turn hydration parity (native loops)");

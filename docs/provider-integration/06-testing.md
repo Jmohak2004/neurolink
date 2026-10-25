@@ -5,7 +5,7 @@
 - All tests use `tsx` directly — there is no `vitest`/`jest` runner despite `vitest.config.ts` existing
 - Each suite is a standalone `test/continuous-test-suite-<name>.ts` script; it logs pass/fail and exits with code 0/1
 - The orchestrator is `test/continuous-test-suite.ts` (run via `pnpm test`)
-- All tests read env vars; missing-credential is treated as **skip** (not fail) for provider tests
+- All tests read env vars; missing-credential is treated as **skip** (not fail) for provider tests. The nightly live matrix is the exception for a provider that HAS its secret: see "The live gate" below
 
 ## Files to edit
 
@@ -31,6 +31,24 @@ If you're adding a new provider, add it to `providerMatrix.ts`'s
 `PROVIDERS` map so `test:matrix` picks it up automatically;
 `test:provider-structure` needs no edits — it derives its expectations from
 the `AIProviderName` enum and the filesystem, not a hand-maintained list.
+
+**The live gate.** A provider that has its secret (or whose catalog JSON
+records a `liveMatrix` run) is expected to answer, so in `test:matrix` and
+`test:matrix:cli` a credential error (401, 403, invalid key), an account error
+(402, billing, a tier gate) or a rate limit (429) **fails** its cell instead of
+skipping. The status is read from the error object (`statusCode`, then its
+`cause` chain) because the SDK often drops it from the message. A known-broken
+provider is excused only by a dated entry in `LIVE_GATE_ALLOWLIST`
+(`test/helpers/liveGate.ts`): each entry has a reason and an expiry at most 14
+days after it was added, and an expired entry excuses nothing. A provider with
+no secret and no recorded run is skipped in one quiet line without calling the
+SDK. The nightly sweep prints a coverage table and fails when fewer than
+`MIN_PASSED_PROVIDERS` providers passed (`LIVE_MATRIX_ENFORCE_FLOOR=1`, set by
+the workflow). The gate throws `HardFail` (`test/helpers/harness.ts`), which
+`test()` never downgrades: the failure message necessarily contains "401" or
+"rate limit", which `isExpectedProviderError()` would turn into a skip.
+`pnpm run test:live-gate` shows all of this against a local server that answers
+200, 401, 402, 429 and 503.
 
 ### B. `test/continuous-test-suite-credentials.ts`
 

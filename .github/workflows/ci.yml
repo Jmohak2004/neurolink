@@ -92,7 +92,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -354,12 +354,12 @@ jobs:
 
   # The work. Split by measured duration: test:providers-mocked alone is
   # 4m13s of this job's 10m14s; the remaining eight suites total roughly the
-  # same. Two shards therefore halve it rather than leaving one long tail.
+  # same. Two shards therefore halve it rather than leaving one long tail; the observability shard runs beside them.
   provider-safety-net-shards:
     strategy:
       fail-fast: false
       matrix:
-        group: [contract, rest]
+        group: [contract, rest, observability]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -370,7 +370,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -507,9 +507,29 @@ jobs:
         if: matrix.group == 'rest'
         run: pnpm run test:aistudio-loop-characterization
 
+      - name: zod tool schemas on the wire (pinned shapes, local stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:zod-wire-schemas
+
       - name: 🧩 Provider Onboarding Completeness
         if: matrix.group == 'rest'
         run: pnpm run verify:provider-onboarding
+
+      # The observability suites (BZ-6924) are credential-free: fake provider
+      # servers, local OTLP receivers and recorded replies. Two of them compare
+      # the working tree with the merged PR and its parent through `git show`,
+      # and the checkout above is shallow, so those commits are fetched first.
+      - name: Fetch the commits the observability suites compare against
+        if: matrix.group == 'observability'
+        run: git fetch --no-tags --depth=1 origin fc892bbb58087096594f7ab80d5105e62a94189c 2d394138094c3b89015975ea3fdce69e4a75a5c9
+
+      - name: Observability suite (fake servers, no API keys required)
+        if: matrix.group == 'observability'
+        run: pnpm run test:observability
+
+      - name: Observability follow-up suites (local OTLP receivers, no API keys required)
+        if: matrix.group == 'observability'
+        run: pnpm run test:observability:followups
 
   # REQUIRED. A red run here blocks the merge.
   #
@@ -561,7 +581,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -670,6 +690,7 @@ jobs:
           pnpm run test:forced-tool-declared
           pnpm run test:span-content-redaction
           pnpm run test:voice-turn-memory
+          pnpm run test:redis-atomic-expiry
           pnpm run test:memory:hippocampus
           pnpm run test:security-check-filter
           pnpm run test:decide
@@ -677,6 +698,7 @@ jobs:
           pnpm run test:mcp:infra
           pnpm run test:mcp:spans
           pnpm run test:mcp:stdio-lifecycle
+          pnpm run test:proxy-egress
           pnpm run test:proxy-connect-retry
           pnpm run test:proxy-restart
           pnpm run test:tool-routing
@@ -712,7 +734,7 @@ jobs:
   #     - name: Setup PNPM
   #       uses: pnpm/action-setup@v4
   #       with:
-  #         version: 9
+  #         version: 10.28.2
 
   #     - name: Setup Node.js
   #       uses: actions/setup-node@v4
@@ -796,7 +818,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -890,7 +912,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -959,7 +981,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -1237,6 +1259,7 @@ jobs:
             test:tool-reliability@57
             test:reasoning-parity-live@19
             test:auth@50
+            test:adapter-request-context@5
             test:vertex-claude-characterization@46
             test:openai-compat-catalog@24
             test:decide-catalog-schema@20
@@ -1244,6 +1267,9 @@ jobs:
             test:openai-compat-streaming-retry@16
             test:servers@16
             test:agent-input-guard@17
+            test:proxy-image-input@40
+            test:body-limits@13
+            test:proxy-codex-policy-refusal@60
             test:video:unit@12
             test:adjust-body-after-400@10
             test:anthropic-streaming-retry@10
@@ -1353,7 +1379,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -1379,7 +1405,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -1573,7 +1599,7 @@ jobs:
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
         with:
-          version: 10.15.1
+          version: 10.28.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

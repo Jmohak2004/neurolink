@@ -12,10 +12,13 @@ import type { ProxyRuntimeConfigProvider } from "./proxy.js";
 import type { TTSAudioFormat } from "./tts.js";
 import type {
   STTCorrectionOptions,
-  STTDictionaryEntry,
-  STTFallbackOptions,
   STTDecisionRecord,
+  STTDictionaryEntry,
   STTEngineInfo,
+  STTFallbackOptions,
+  STTOutputOptions,
+  STTOutputRendering,
+  STTRoutingOptions,
   STTStreamingOptions,
   TranscribeTimings,
 } from "./transcribe.js";
@@ -68,6 +71,42 @@ export type ServerAdapterConfig = {
 
   /** Shutdown configuration for graceful shutdown behavior */
   shutdown?: ShutdownConfig;
+
+  /**
+   * Carry what middleware sets on its context (`ctx.user`, `ctx.session`,
+   * `ctx.metadata`, `ctx.abortSignal` and `ctx.abortController`) to later
+   * middleware and to the route handler, on every built-in adapter (default:
+   * `false`). It does not apply to a context you build yourself: a custom
+   * adapter, or a route handler called directly, can supply a context that
+   * already has `ctx.user` set.
+   *
+   * Off, each adapter propagates context as it always did. Express, Fastify
+   * and Koa build a fresh context for every middleware step and for the
+   * handler and carry only `responseHeaders`; Hono shares one context between
+   * the steps and the handler only when the caller sent its own
+   * `X-Request-ID`. So a role guard, a permission guard or a rate-limit
+   * `keyGenerator` registered after authentication sees `ctx.user` only on
+   * that Hono request shape: on Express, Fastify and Koa, and on Hono without
+   * a caller `X-Request-ID`, the user never reaches it and the guard refuses
+   * everyone.
+   *
+   * On, the user and the rest reach later middleware and the handler on every
+   * built-in adapter. Set it when guards or key generators depend on `ctx.user`.
+   * `registerAllRoutes()` turns it on for the server by itself when called with
+   * `perUserAuth`, which needs the user in the handler. A caller that builds
+   * the agent routes with `createAgentRoutes(basePath, { perUserAuth: true })`
+   * and registers them itself must set this on the server: with it off, such a
+   * request has a user only on Hono when the client sent its own
+   * `X-Request-ID`, and every other request runs as anonymous (no `userId`, no
+   * session).
+   *
+   * The agent routes' warning about a body naming another user is raised only
+   * with this on. With it off, a handler that does receive `ctx.user` (Hono
+   * when the caller sent its own `X-Request-ID`) takes the user from it and
+   * ignores the body's `userId`, so nothing is named over it; every other
+   * request reaches the handler without a `ctx.user` to compare against.
+   */
+  carryMiddlewareState?: boolean;
 };
 
 /**
@@ -87,6 +126,7 @@ export type RequiredServerAdapterConfig = {
   disableBuiltInHealth: boolean;
   redaction?: RequiredRedactionConfig;
   shutdown: RequiredShutdownConfig;
+  carryMiddlewareState: boolean;
 };
 
 /**
@@ -169,11 +209,20 @@ export type BodyParserConfig = {
   /** Enable body parsing (default: true) */
   enabled?: boolean;
 
-  /** Maximum body size (default: "10mb") */
+  /** Maximum body size for parsed bodies (default: "10mb") */
   maxSize?: string;
 
   /** JSON body limit (default: "10mb") */
   jsonLimit?: string;
+
+  /**
+   * Maximum size of a raw upload: `multipart/form-data`, `audio/*` and
+   * `application/octet-stream` bodies, which reach a route as bytes
+   * (the transcription routes). Default: `maxSize` when set, else "64mb";
+   * the transcription routes apply their own `maxAudioBytes` (50 MB)
+   * beneath it.
+   */
+  rawMaxSize?: string;
 
   /** Enable URL-encoded body parsing */
   urlEncoded?: boolean;
@@ -186,6 +235,7 @@ export type RequiredBodyParserConfig = {
   enabled: boolean;
   maxSize: string;
   jsonLimit: string;
+  rawMaxSize: string;
   urlEncoded: boolean;
 };
 
@@ -331,6 +381,16 @@ export type ServerContext = {
   /** Redaction configuration (for stream redaction support) */
   redaction?: RedactionConfig;
 };
+
+/**
+ * What middleware sets on its context that later middleware and the route
+ * handler must see. Adapters build a fresh context for every step, so this is
+ * what they carry between steps in the framework's per-request storage.
+ */
+export type ServerCarriedContext = Pick<
+  ServerContext,
+  "user" | "session" | "metadata" | "abortSignal" | "abortController"
+>;
 
 /**
  * Server response object
@@ -622,6 +682,64 @@ export type ServerAgentRouteOptions = {
    * file or download that would overflow it stops mid-transfer.
    */
   maxInputTotalBytes?: number;
+  /**
+   * For a caller of `createAgentRoutes()` itself; with `registerAllRoutes()` /
+   * `createAllRoutes()` use `CreateRoutesOptions.perUserAuth` instead. The
+   * routes can only take identity from `ctx.user` if the server hands it to
+   * the handler, so a caller that registers them itself with this option must
+   * create the server with `carryMiddlewareState: true`; `registerAllRoutes()`
+   * does that for the server by itself. With `carryMiddlewareState` off, such a request has
+   * a user only on Hono when the client sent its own `X-Request-ID` (Hono then
+   * hands the handler the middleware's context regardless); every other request
+   * runs as anonymous, with no `userId` and no session.
+   *
+   * Set to `true` when the authentication middleware identifies individual
+   * people (one credential per person). The agent routes then take `userId`
+   * and the session only from the authenticated user (`ctx.user`,
+   * `ctx.session`) and ignore the request body's, on every adapter and for
+   * every request, so a caller cannot act as someone else. A request with no
+   * authenticated user gets no `userId` and no session, so with optional
+   * authentication anonymous callers never share a conversation. Any truthy
+   * value turns it on.
+   *
+   * **A server with per-person authentication must set this.** Left at the
+   * default (`false`) identity resolves as it always has: requests choose
+   * `userId` and `sessionId` in the body, so any authenticated caller can name
+   * another person there and act as them. The one exception is Hono, where a
+   * request whose client sent its own `X-Request-ID` header reaches the
+   * handler with the middleware's context, and an authenticated `ctx.user`
+   * (and `ctx.session`) wins over the body, as before, and so does it on a
+   * context the built-in adapters did not build (your own adapter, a handler
+   * called directly). Only this flag, with `carryMiddlewareState` on, makes the agent routes take
+   * the user from `ctx.user`, and ignore the body's `userId`, on every
+   * built-in adapter and every request. When the server carries middleware state
+   * the routes log one warning per instance the first time a request served
+   * from the body names a different `userId` than a `ctx.user` that is not
+   * marked `shared: true`; the body's `userId` is still used. With `carryMiddlewareState`
+   * off the handler has no `ctx.user` on such a request, so there is nothing to
+   * compare and no warning.
+   *
+   * Leave it unset for no authentication or one shared API key, such as
+   * `neurolink serve` with `NEUROLINK_SERVER_API_KEY`: a shared key names no
+   * person, so requests choose `userId` and `sessionId` in the body. Middleware
+   * for a shared key should set `shared: true` on the `AuthenticatedUser` it
+   * returns, which keeps the warning quiet (the CLI's key middleware does).
+   */
+  perUserAuth?: boolean;
+};
+
+/**
+ * The route options plus the one thing that belongs to a single call:
+ * `resolveAgentInput` options. A signal is not route configuration, so it is
+ * kept off {@link ServerAgentRouteOptions}, where `createAgentRoutes` would
+ * apply it to every request.
+ */
+export type ServerAgentResolveOptions = ServerAgentRouteOptions & {
+  /**
+   * Cancels the resolution: an `https` download in flight is aborted and no
+   * further attachment is started. Omitted, nothing can cancel it.
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -987,6 +1105,15 @@ export type WebSocketRequestId = string | number;
  */
 export type AuthenticatedUser = {
   id: string;
+  /**
+   * `true` when this identity stands for every holder of one credential, such
+   * as a shared API key, rather than for one person. The agent routes then do
+   * not warn when a request names a different `userId` in its body: with a
+   * shared key every caller is one trust domain and the body is how callers
+   * keep separate conversation memory. Middleware that sets one fixed user for
+   * everyone holding a key should set this; per-person middleware should not.
+   */
+  shared?: boolean;
   email?: string;
   name?: string;
   roles?: string[];
@@ -1381,6 +1508,13 @@ export type AuthResult = {
   /** User roles (optional) */
   roles?: string[];
 
+  /**
+   * `true` when this identity stands for every holder of one credential, such
+   * as a shared API key, rather than one person. Carried to `ctx.user.shared`;
+   * see `AuthenticatedUser.shared`.
+   */
+  shared?: boolean;
+
   /** Additional user data */
   metadata?: Record<string, unknown>;
 };
@@ -1506,9 +1640,46 @@ export type CreateRoutesOptions = {
   /**
    * Options for the agent routes (`POST <basePath>/agent/execute` and
    * `/agent/stream`): where local-path attachments may be read from, and how
-   * large an attachment may be.
+   * large an attachment may be. Whose identity the routes trust is decided by
+   * the top-level `perUserAuth`, which is why it is not accepted here.
    */
-  agent?: ServerAgentRouteOptions;
+  agent?: Omit<ServerAgentRouteOptions, "perUserAuth">;
+  /**
+   * Set to `true` when the authentication middleware identifies individual
+   * people (one credential per person). The agent routes then take `userId`
+   * and the session only from the authenticated user and ignore the request
+   * body's, on every adapter and for every request; a request with no
+   * authenticated user gets neither. Any truthy value turns it on.
+   *
+   * **A server with per-person authentication must set this.** Left at the
+   * default (`false`) requests choose `userId` and `sessionId` in the body, so
+   * any authenticated caller can name another person there and act as them.
+   * The one exception is Hono, where a request whose client sent its own
+   * `X-Request-ID` header reaches the handler with the middleware's context and
+   * an authenticated `ctx.user` wins over the body, as before, and so on a
+   * context the built-in adapters did not build (your own adapter, a handler
+   * called directly); only this flag, with `carryMiddlewareState` on, makes the agent routes take
+   * the user from `ctx.user` everywhere. When the server carries middleware state, the first time a
+   * request served from the body names a different `userId` than its
+   * `ctx.user`, the routes log a warning (once per instance); with `carryMiddlewareState`
+   * off the handler has no `ctx.user` to compare, and there is no warning.
+   * Leave it unset for no authentication or one shared
+   * API key, such as `neurolink serve` with `NEUROLINK_SERVER_API_KEY`:
+   * requests choose `userId` and `sessionId` in the body. Middleware for a
+   * shared key should set `shared: true` on the `AuthenticatedUser` it
+   * returns, which keeps the warning quiet.
+   *
+   * This is the one switch for a server built with `registerAllRoutes` /
+   * `createAllRoutes`: every route group that scopes by identity reads it from
+   * here, so it cannot be set for the agent routes alone. `registerAllRoutes`
+   * also turns on the server's `carryMiddlewareState` when this is set, since
+   * the routes need the user in the handler; `createAllRoutes` returns route
+   * groups only, so a caller that registers them itself must create the server
+   * with `carryMiddlewareState: true`; with `carryMiddlewareState` off, a `perUserAuth`
+   * request has a user only on Hono when the client sent its own
+   * `X-Request-ID`, and every other request runs as anonymous.
+   */
+  perUserAuth?: boolean;
 };
 
 // =============================================================================
@@ -1516,6 +1687,32 @@ export type CreateRoutesOptions = {
 // =============================================================================
 
 /** Options for `createTranscribeRoutes()`. */
+/**
+ * What `GET /agent/transcribe/providers` reports: the engines this server
+ * can transcribe with, which one a request without a provider gets, and the
+ * models behind the correction layer. Never a key or a URL with a secret.
+ */
+export type ServerTranscribeCapabilities = {
+  /** The provider a request without one goes to. */
+  default: string;
+  providers: Array<{
+    name: string;
+    /** `builtin` ships with NeuroLink, `endpoint` comes from `NEUROLINK_STT_ENDPOINTS`, `registered` was added at runtime. */
+    kind: "builtin" | "endpoint" | "registered";
+    model?: string;
+    /** The endpoint can answer a language verdict without transcribing (batch probe). */
+    languageProbe?: boolean;
+    /** The endpoint takes a language prior between utterances. */
+    languagePrior?: boolean;
+  }>;
+  correction: {
+    /** The decision model that judges dictionary candidates; `null` when none is configured (the dictionary is then applied as is). */
+    decision: { provider: string; model: string } | null;
+    /** The text model of the rewrite; `provider` is `null` when the instance default applies. */
+    rewrite: { provider: string | null; model: string | null };
+  };
+};
+
 export type ServerTranscribeRouteOptions = {
   /**
    * Directories a request's `audioPath` may point into. Empty or omitted (the
@@ -1531,6 +1728,159 @@ export type ServerTranscribeRouteOptions = {
    * `http://host:port/v1` works unchanged.
    */
   openaiBasePath?: string;
+  /**
+   * The STT evaluation collector, `POST <openaiBasePath>/v1/evals/stt`.
+   * On by default; `false` removes its routes.
+   */
+  evals?: ServerSTTEvalOptions | false;
+};
+
+/** Where and how much the STT evaluation collector keeps. */
+export type ServerSTTEvalOptions = {
+  /**
+   * Directory for one JSON-lines file per call, replayed on start. Default
+   * `NEUROLINK_STT_EVAL_DIR`; without either, calls live in memory only.
+   */
+  dir?: string;
+  /** Calls held in memory; the least recently updated are evicted (still on disk). Default 1000. */
+  maxCalls?: number;
+  /** Segments kept per call; later new ids are counted as `ignored`. Default 50,000. */
+  maxSegmentsPerCall?: number;
+};
+
+/** One finalized transcript segment, from the STT people saw or the one run alongside it. */
+export type ServerSTTEvalSegment = {
+  /** Stable per segment: a resend with the same id replaces it. */
+  id: string;
+  /** `primary` = shown to users, `shadow` = run for evaluation only. */
+  source: "primary" | "shadow";
+  model: string;
+  participant_identity: string;
+  participant_name?: string;
+  text: string;
+  language?: string | null;
+  /** Epoch seconds, when the STT reports timings. */
+  start_time?: number | null;
+  end_time?: number | null;
+  /** Epoch seconds the sender received the final. */
+  received_at: number;
+};
+
+/** Body of `POST /v1/evals/stt`: one batch of a call's segments. */
+export type ServerSTTEvalBatchRequest = {
+  call_id: string;
+  room?: string;
+  /** 1, 2, … per call. Numbers may skip when a send failed and was folded into the next. */
+  batch: number;
+  /** True on the batch sent after the last participant left. */
+  final?: boolean;
+  models: { primary: string; shadow: string };
+  segments: ServerSTTEvalSegment[];
+};
+
+/** Answer to `POST /v1/evals/stt`. */
+export type ServerSTTEvalBatchResponse = {
+  call_id: string;
+  batch: number;
+  final: boolean;
+  /** New segment ids. */
+  inserted: number;
+  /** Ids already held (a resend), replaced. */
+  updated: number;
+  /** New ids refused because the call is at `maxSegmentsPerCall`. */
+  ignored: number;
+  segments: { primary: number; shadow: number };
+};
+
+/** One call in `GET /v1/evals/stt`. */
+export type ServerSTTEvalCallSummary = {
+  call_id: string;
+  room: string | null;
+  models: { primary: string; shadow: string };
+  final: boolean;
+  batches: number;
+  segments: { primary: number; shadow: number };
+  speakers: number;
+  first_received_at: number | null;
+  last_received_at: number | null;
+  /** Epoch ms this server last accepted a batch. */
+  updated_at: number;
+};
+
+/** One STT's side of a speaker's comparison. */
+export type ServerSTTEvalSide = {
+  model: string;
+  segments: number;
+  words: number;
+  /** Languages the STT reported, most frequent first. */
+  languages: string[];
+  /** Mean seconds from the end of speech to the final, when the STT reports timings. */
+  mean_latency_s: number | null;
+};
+
+/**
+ * Agreement between the two STTs for one speaker. Neither side is ground
+ * truth: `disagreement` is the word edit distance between them divided by the
+ * primary's word count, so 0 means both wrote the same words.
+ */
+export type ServerSTTEvalComparison = {
+  participant_identity: string;
+  participant_name: string;
+  primary: ServerSTTEvalSide;
+  shadow: ServerSTTEvalSide;
+  /** Word edit distance / primary words, on normalized text. Null when the primary wrote nothing. */
+  disagreement: number | null;
+  /** The same on phonetic word keys, so one STT writing Devanagari and the other Latin is not counted as a difference. */
+  phonetic_disagreement: number | null;
+  /** `full` aligns the whole speaker; `windowed` aligns 5-minute windows of a long speaker. */
+  method: "full" | "windowed";
+};
+
+/**
+ * Where the STT evaluation collector exports to Langfuse. Read only from the
+ * server's environment (`NEUROLINK_STT_EVAL_LANGFUSE_*`): neither a request
+ * nor a route option can redirect evaluation data.
+ */
+export type ServerSTTEvalLangfuseConfig = {
+  publicKey: string;
+  secretKey: string;
+  /** Default `https://cloud.langfuse.com`. */
+  baseUrl: string;
+  environment?: string;
+};
+
+/** One event of Langfuse's public ingestion API (`POST /api/public/ingestion`). */
+export type ServerSTTEvalLangfuseEvent = {
+  id: string;
+  timestamp: string;
+  type: "trace-create" | "event-create" | "score-create";
+  body: Record<string, unknown>;
+};
+
+/** A call as the evaluation store holds it in memory. */
+export type ServerSTTEvalCallRecord = {
+  callId: string;
+  room: string | null;
+  models: { primary: string; shadow: string };
+  final: boolean;
+  batches: Set<number>;
+  segments: Map<string, ServerSTTEvalSegment>;
+  updatedAt: number;
+};
+
+/** Word edit distance between two readings, and the reference's word count. */
+export type ServerSTTEvalAlignment = { distance: number; refWords: number };
+
+/** `GET /v1/evals/stt/:callId`. */
+export type ServerSTTEvalReport = ServerSTTEvalCallSummary & {
+  /** Over every speaker: summed edit distances / summed primary words. */
+  overall: {
+    disagreement: number | null;
+    phonetic_disagreement: number | null;
+  };
+  speakers_compared: ServerSTTEvalComparison[];
+  /** Present with `?segments=true`, ordered by time. */
+  segment_list?: ServerSTTEvalSegment[];
 };
 
 /**
@@ -1553,6 +1903,11 @@ export type ServerTranscribeRequest = {
   dictionary?: STTDictionaryEntry[];
   correction?: STTCorrectionOptions;
   fallback?: STTFallbackOptions;
+  routing?: STTRoutingOptions;
+  /** `"utterances"` runs the recording through the live pipeline (see `TranscribeOptions.chunking`). */
+  chunking?: "engine" | "utterances";
+  /** Renderings in other languages and scripts (see `TranscribeOptions.output`). */
+  output?: Omit<STTOutputOptions, "languages"> & { languages: string[] };
   diarization?: boolean;
   wordTimestamps?: boolean;
   timeoutMs?: number;
@@ -1605,6 +1960,8 @@ export type ServerOpenAITranscriptionResponse = {
   language_detected?: boolean;
   steps: string[];
   timings: TranscribeTimings;
+  /** NeuroLink extension: one rendering per requested output language. */
+  outputs?: Record<string, STTOutputRendering>;
 };
 
 /** Options for `attachTranscribeWebSocket()`. */
@@ -1628,6 +1985,110 @@ export type ServerTranscribeWebSocketOptions = {
   allowedOrigins?: readonly string[];
   /** Largest single frame, in bytes. Default 1 MiB. */
   maxPayload?: number;
+  /**
+   * Listener path of transcription sessions: a socket here reads one
+   * session's speakers in its own languages. Default `<path>/subscribe`;
+   * `false` turns sessions off (a `?session=` on the stream path is then
+   * ignored).
+   */
+  subscribePath?: string | false;
+  /**
+   * OpenAI Realtime transcription path (`?intent=transcription`): the
+   * protocol of OpenAI's `/v1/realtime`, so any OpenAI-Realtime client — the
+   * LiveKit `openai.STT(use_realtime=True)` plugin, Pipecat, the OpenAI SDK —
+   * streams to NeuroLink with no adapter. Default `/v1/realtime`; `false`
+   * turns it off.
+   */
+  realtimePath?: string | false;
+  /**
+   * Profiles a realtime client selects with its `model` name. Merged over
+   * `NEUROLINK_STT_REALTIME_PROFILES` (a JSON object of the same shape);
+   * these win on a name in both.
+   */
+  realtimeProfiles?: Readonly<Record<string, ServerSTTRealtimeProfile>>;
+};
+
+/**
+ * What an OpenAI-Realtime client gets when it names this profile as its
+ * `model`. A realtime client can send only a model, a language, a prompt and
+ * turn-detection numbers, so everything NeuroLink-specific (engine, fallback,
+ * dictionary, correction, output languages) is the operator's, here.
+ *
+ * A `model` that is no profile but a configured STT provider uses that
+ * provider with the defaults; any other name (OpenAI's own
+ * `gpt-4o-mini-transcribe`, say) uses the profile named `default`, or the
+ * server's defaults when there is none.
+ */
+export type ServerSTTRealtimeProfile = Omit<
+  ServerTranscribeStreamConfig,
+  "mode"
+> & {
+  /**
+   * What `…input_audio_transcription.completed` carries: the corrected text
+   * (`"corrected"`, default; it waits up to `correctionWaitMs` for the
+   * correction, then sends the raw final) or the raw final at once.
+   */
+  completed?: "corrected" | "final";
+  /** Longest wait for the correction before `completed` goes out with the final. Default 3000. */
+  correctionWaitMs?: number;
+  /**
+   * Whether the client's `language` pins the transcription. Default `true`.
+   * Note the LiveKit plugin sends `"en"` unless `detect_language=True`.
+   */
+  clientLanguage?: boolean;
+  /**
+   * Whether the client's `turn_detection.silence_duration_ms` sets the
+   * utterance's closing pause. Default `false`: NeuroLink's endpointer keeps
+   * its own (750 ms), since a client default such as LiveKit's 350 ms cuts
+   * conversational speech mid-sentence.
+   */
+  clientTurnDetection?: boolean;
+};
+
+/** The parts of a `ws` socket the realtime handler uses. */
+export type ServerRealtimeSocket = {
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  on(
+    event: "message",
+    listener: (
+      data: Buffer | ArrayBuffer | Buffer[],
+      isBinary: boolean,
+    ) => void,
+  ): unknown;
+  on(event: "close" | "error", listener: () => void): unknown;
+};
+
+/** What a realtime client configured, read from either session dialect. */
+export type ServerRealtimeSessionConfig = {
+  dialect: "ga" | "beta";
+  rate: number;
+  model?: string;
+  language?: string;
+  prompt?: string;
+  silenceMs?: number;
+};
+
+/** One utterance on the realtime wire: a conversation item. */
+export type ServerRealtimeItem = {
+  utterance: number;
+  itemId: string;
+  /** `speech_started` went out. */
+  started: boolean;
+  /** The committed prefix already sent as deltas. */
+  sent: string;
+  /** Server events held until every earlier item has completed. */
+  pending: Array<{ type: string; body: Record<string, unknown> }>;
+  finalText?: string;
+  engine?: string;
+  language?: string;
+  languageDetected?: boolean;
+  corrected: boolean;
+  /** The transcript `completed` will carry, once known. */
+  ready?: string;
+  done: boolean;
+  timer?: ReturnType<typeof setTimeout>;
 };
 
 // =============================================================================

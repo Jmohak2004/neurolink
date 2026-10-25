@@ -4,9 +4,11 @@ import type {
   DecisionDialect,
   DecisionError,
   DecisionPreparedMedia,
+  DecisionRequest,
   DecisionState,
   UnknownRecord,
 } from "../types/index.js";
+import { decisionQuestionTypeOf } from "../utils/decisionLimits.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForError } from "../utils/logSanitize.js";
 import { getProviderModel } from "../utils/providerConfig.js";
@@ -113,6 +115,33 @@ export class ConfiguredDecisionProvider extends SystemOneDecisionProvider {
     return this.endpoint;
   }
 
+  /**
+   * `decide.capableModel` in place of the default, for a request that carries
+   * media or one of its question types, when nobody chose a model: the call
+   * names none, the model variable is unset, and the instance is on the
+   * default. A model somebody chose is always the one sent.
+   */
+  protected override resolveRequestModel(request: DecisionRequest): string {
+    const chosen = super.resolveRequestModel(request);
+    const capable = this.entry.decide.capableModel;
+    if (
+      capable === undefined ||
+      request.model !== undefined ||
+      chosen !== this.entry.models.default ||
+      readText(process.env[catalogEnvVar(this.entry, "model")]) !== ""
+    ) {
+      return chosen;
+    }
+    const carriesMedia =
+      (request.images?.length ?? 0) > 0 ||
+      request.video !== undefined ||
+      request.audio !== undefined;
+    const asksFor = Object.values(request.questions).some((question) =>
+      capable.questionTypes.includes(decisionQuestionTypeOf(question)),
+    );
+    return carriesMedia || asksFor ? capable.model : chosen;
+  }
+
   protected decisionHeaders(): Record<string, string> {
     const credential: Record<string, string> =
       this.entry.decide.authHeader === "x-api-key"
@@ -171,6 +200,7 @@ export class ConfiguredDecisionProvider extends SystemOneDecisionProvider {
       requestId,
       label: this.entry.displayName,
       apiKey: this.apiKey,
+      apiKeyEnvVar: catalogEnvVar(this.entry, "apiKey"),
     });
   }
 

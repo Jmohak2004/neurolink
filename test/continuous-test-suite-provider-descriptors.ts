@@ -788,16 +788,16 @@ async function runDescriptorTests(
         (name) => [name, process.env[name]],
       ),
     );
-    names.forEach((name) => {
-      delete process.env[name];
-    });
-    process.env.GROQ_API_KEY = "test-credential-not-real";
-    // Reapply all owned routes after this test deliberately clears env.
-    runtimeFixtures.pinRuntimeEndpoints();
-    // Health results are cached per provider, and earlier cases filled the
-    // cache under other environments, so the choice would not see this one.
-    ProviderHealthChecker.clearHealthCache();
     try {
+      names.forEach((name) => {
+        delete process.env[name];
+      });
+      process.env.GROQ_API_KEY = "test-credential-not-real";
+      // Reapply all owned routes after this test deliberately clears env.
+      runtimeFixtures.pinRuntimeEndpoints();
+      // Health results are cached per provider, and earlier cases filled the
+      // cache under other environments, so the choice would not see this one.
+      ProviderHealthChecker.clearHealthCache();
       const chosen = await getBestProvider().catch(() => "");
       assertEqual(
         chosen,
@@ -975,6 +975,9 @@ async function runDescriptorTests(
     // the skip branch is what keeps them off the network. Every non-loopback
     // socket and fetch is recorded and refused while the probe runs; loopback
     // traffic (this suite's own runtime fixtures) goes through untouched.
+    // The `try` opens before the first hook or variable is touched: a throw
+    // while installing them, or from constructing NeuroLink, must still reach
+    // the `finally` that undoes them, or every later case runs behind them.
     const net = await import("node:net");
     const attempts: string[] = [];
     const originalConnect = net.Socket.prototype.connect;
@@ -991,42 +994,44 @@ async function runDescriptorTests(
     const savedEnv = Object.fromEntries(
       Object.keys(testEnv).map((k) => [k, process.env[k]]),
     );
-    Object.assign(process.env, testEnv);
-    net.Socket.prototype.connect = function (
-      this: InstanceType<typeof net.Socket>,
-      ...connectArgs: unknown[]
-    ) {
-      const first = connectArgs[0];
-      const opts =
-        typeof first === "object" && first !== null
-          ? (first as { host?: unknown; path?: unknown })
-          : {};
-      const target = String(
-        opts.host ?? opts.path ?? connectArgs[1] ?? "localhost",
-      );
-      if (opts.path !== undefined || isLoopback(target)) {
-        return Reflect.apply(originalConnect, this, connectArgs);
-      }
-      attempts.push(target);
-      queueMicrotask(() => this.destroy(new Error("blocked by test")));
-      return this;
-    } as typeof net.Socket.prototype.connect;
-    globalThis.fetch = (async (
-      input: string | URL | Request,
-      init?: RequestInit,
-    ) => {
-      const url = new URL(
-        typeof input === "string" || input instanceof URL ? input : input.url,
-      );
-      if (isLoopback(url.hostname)) {
-        return originalFetch(input, init);
-      }
-      attempts.push(`fetch:${url.host}`);
-      throw new Error("blocked by test");
-    }) as typeof fetch;
-    const { NeuroLink } = await import("../dist/index.js");
-    const nl = new NeuroLink();
+    let shutdown: (() => Promise<void>) | undefined;
     try {
+      Object.assign(process.env, testEnv);
+      net.Socket.prototype.connect = function (
+        this: InstanceType<typeof net.Socket>,
+        ...connectArgs: unknown[]
+      ) {
+        const first = connectArgs[0];
+        const opts =
+          typeof first === "object" && first !== null
+            ? (first as { host?: unknown; path?: unknown })
+            : {};
+        const target = String(
+          opts.host ?? opts.path ?? connectArgs[1] ?? "localhost",
+        );
+        if (opts.path !== undefined || isLoopback(target)) {
+          return Reflect.apply(originalConnect, this, connectArgs);
+        }
+        attempts.push(target);
+        queueMicrotask(() => this.destroy(new Error("blocked by test")));
+        return this;
+      } as typeof net.Socket.prototype.connect;
+      globalThis.fetch = (async (
+        input: string | URL | Request,
+        init?: RequestInit,
+      ) => {
+        const url = new URL(
+          typeof input === "string" || input instanceof URL ? input : input.url,
+        );
+        if (isLoopback(url.hostname)) {
+          return originalFetch(input, init);
+        }
+        attempts.push(`fetch:${url.host}`);
+        throw new Error("blocked by test");
+      }) as typeof fetch;
+      const { NeuroLink } = await import("../dist/index.js");
+      const nl = new NeuroLink();
+      shutdown = () => nl.shutdown();
       const statuses = await nl.getProviderStatus({ quiet: true });
       const byName = new Map(
         statuses.map((s: { provider: string }) => [s.provider, s]),
@@ -1074,7 +1079,7 @@ async function runDescriptorTests(
           process.env[k] = v;
         }
       }
-      await nl.shutdown();
+      await shutdown?.();
     }
   });
 
